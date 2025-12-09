@@ -20,15 +20,23 @@ static std::unordered_map<std::string_view, opmode> opmodes{
     {"FORWARD", opmode::FORWARD},
     {"RECEIVE", opmode::RECEIVE}};
 
+static bool is_sender(opmode role){
+    return role == opmode::FORWARD || role == opmode::PING || role == opmode::PONG;
+}
+
+static bool is_receiver(opmode role){
+    return role == opmode::RECEIVE || role == opmode::PING || role == opmode::PONG;
+}
+
 static std::pair<rte_mempool *, rte_mempool *>
 alloc_pools(opmode role, uint16_t recv_pool_sz, uint16_t send_pool_sz,
             std::string_view r_name, std::string_view s_name) {
   std::pair<rte_mempool *, rte_mempool *> pools{nullptr, nullptr};
-  if (role == opmode::FORWARD || role == opmode::PING || role == opmode::PONG)
+  if (is_sender(role))
     pools.first =
         rte_pktmbuf_pool_create(s_name.data(), send_pool_sz, MEMPOOL_CACHE_SIZE,
                                 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
-  if (role == opmode::RECEIVE || role == opmode::PING || role == opmode::PONG)
+  if (is_receiver(role))
     pools.second =
         rte_pktmbuf_pool_create(r_name.data(), recv_pool_sz, MEMPOOL_CACHE_SIZE,
                                 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
@@ -135,12 +143,15 @@ int benchmark_config::port_init(port_info &info) {
       dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_IPV4_CKSUM;
   info.caps.ip_cksum_tx =
       dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_UDP_CKSUM;
-
+  nb_tx = is_sender(role) ? nb_tx : 0;
+  nb_rx = is_receiver(role) ? nb_rx : 0;
   retval = rte_eth_dev_configure(port, nb_rx, nb_tx, &port_conf);
   if (retval != 0)
     throw std::runtime_error("Could not configure device");
 
   retval = rte_eth_dev_adjust_nb_rx_tx_desc(port, &nb_rxd, &nb_txd);
+  if(retval)
+      throw std::runtime_error("Adjusting descriptors failed");
   info.thread_blocks.resize(nb_threads);
   txconf = dev_info.default_txconf;
   txconf.offloads = port_conf.txmode.offloads;
@@ -153,9 +164,9 @@ int benchmark_config::port_init(port_info &info) {
     auto [send_pool, recv_pool] =
         alloc_pools(role, nb_rx * (nb_rxd + burst_size),
                     nb_tx * (nb_txd + burst_size), tb.r_name, tb.s_name);
-    tb.setup_txqueues(port, send_pool ? nb_tx / nb_threads : 0, nb_txd, txconf,
+    tb.setup_txqueues(port, nb_tx / nb_threads, nb_txd, txconf,
                       send_pool);
-    tb.setup_rxqueues(port, recv_pool ? nb_rx / nb_threads : 0 , nb_rxd, rxconf,
+    tb.setup_rxqueues(port, nb_rx / nb_threads, nb_rxd, rxconf,
                       recv_pool);
   }
   retval = rte_eth_dev_start(port);
