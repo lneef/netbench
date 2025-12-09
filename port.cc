@@ -153,9 +153,9 @@ int benchmark_config::port_init(port_info &info) {
     auto [send_pool, recv_pool] =
         alloc_pools(role, nb_rx * (nb_rxd + burst_size),
                     nb_tx * (nb_txd + burst_size), tb.r_name, tb.s_name);
-    tb.setup_txqueues(port, nb_tx / nb_threads, send_pool ? nb_txd : 0, txconf,
+    tb.setup_txqueues(port, send_pool ? nb_tx / nb_threads : 0, nb_txd, txconf,
                       send_pool);
-    tb.setup_rxqueues(port, nb_rx / nb_threads, recv_pool ? nb_rxd : 0, rxconf,
+    tb.setup_rxqueues(port, recv_pool ? nb_rx / nb_threads : 0 , nb_rxd, rxconf,
                       recv_pool);
   }
   retval = rte_eth_dev_start(port);
