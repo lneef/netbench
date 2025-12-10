@@ -1,6 +1,6 @@
 project('dpdk-perf', 'cpp',
-  version: '0.0.1',
-  default_options: ['warning_level=2', 'cpp_std=c++20'])
+  version: '0.1.0',
+  default_options: ['warning_level=2', 'cpp_std=c++20', 'buildtype=release'])
 
 dpdk_dep = dependency('libdpdk', method: 'pkg-config', required: true)
 
