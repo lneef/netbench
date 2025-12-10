@@ -16,6 +16,6 @@ sources_pong = files('pong.cc',
   'port.cc',
   'util.cc')
 
-executable('dpdk-ping', sources_ping, dependencies: dpdk_dep)
-executable('dpdk-pong', sources_pong, dependencies: dpdk_dep)
+executable('dpdk-ping', sources_ping, dependencies: dpdk_dep, link_args: ['-lcap', '-Wl,--allow-multiple-definition', '-Wl,--whole-archive'])
+executable('dpdk-pong', sources_pong, dependencies: dpdk_dep, link_args: ['-lcap', '-Wl,--allow-multiple-definition', '-Wl,--whole-archive'])
 
