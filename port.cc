@@ -112,7 +112,7 @@ int benchmark_config::port_init(port_info &info) {
   struct rte_eth_dev_info dev_info;
   struct rte_eth_rxconf rxconf;
   struct rte_eth_txconf txconf;
-  if (rte_eth_dev_is_valid_port(port))
+  if (!rte_eth_dev_is_valid_port(port))
     throw std::runtime_error(std::format("Invalid port id: {}", port));
   rte_eth_conf port_conf{};
   retval = rte_eth_dev_info_get(port, &dev_info);
