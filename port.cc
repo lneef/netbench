@@ -30,31 +30,31 @@ static bool is_receiver(opmode role) {
          role == opmode::PONG;
 }
 
-static rte_mempool *pool_create(std::string_view name, uint16_t pool_sz,
+static rte_mempool *pool_create(std::string_view name, uint16_t pool_sz, uint16_t lcore_id,
                                 uint32_t buf_sz = RTE_MBUF_DEFAULT_BUF_SIZE) {
   return rte_pktmbuf_pool_create(name.data(), pool_sz, MEMPOOL_CACHE_SIZE, 0,
-                                 buf_sz, rte_socket_id());
+                                 buf_sz, rte_lcore_to_socket_id(lcore_id));
 }
 
 static rte_mempool *setup_send_pool(opmode role, uint16_t pool_sz,
-                                 std::string_view name) {
+                                 std::string_view name, uint16_t lcore_id) {
   switch (role) {
   case opmode::PING:
   case opmode::FORWARD:
-    return pool_create(name, pool_sz, RTE_MBUF_DEFAULT_BUF_SIZE);
+    return pool_create(name, pool_sz, lcore_id, RTE_MBUF_DEFAULT_BUF_SIZE);
   default:
     return nullptr;
   }
 }
 
 static rte_mempool *setup_receive_pool(opmode role, uint16_t pool_sz,
-                                   std::string_view name) {
+                                   std::string_view name, uint16_t lcore_id) {
   switch (role) {
   case opmode::RECEIVE:
   case opmode::PING:
-    return pool_create(name, pool_sz, RTE_MBUF_DEFAULT_BUF_SIZE);
+    return pool_create(name, pool_sz, lcore_id, RTE_MBUF_DEFAULT_BUF_SIZE);
   case opmode::PONG:
-    return pool_create(name, 2 * pool_sz, RTE_MBUF_DEFAULT_BUF_SIZE);
+    return pool_create(name, 2 * pool_sz, lcore_id, RTE_MBUF_DEFAULT_BUF_SIZE);
   default:
     return nullptr;
   }
@@ -62,9 +62,9 @@ static rte_mempool *setup_receive_pool(opmode role, uint16_t pool_sz,
 
 static std::pair<rte_mempool *, rte_mempool *>
 alloc_pools(opmode role, uint16_t recv_pool_sz, uint16_t send_pool_sz,
-            std::string_view r_name, std::string_view s_name) {
-  return {setup_send_pool(role, send_pool_sz, s_name),
-          setup_receive_pool(role, recv_pool_sz, r_name)};
+            std::string_view r_name, std::string_view s_name, uint16_t lcore_id) {
+  return {setup_send_pool(role, send_pool_sz, s_name, lcore_id),
+          setup_receive_pool(role, recv_pool_sz, r_name, lcore_id)};
 }
 
 int benchmark_config::port_init_cmdline(int argc, char **argv) {
@@ -182,12 +182,14 @@ int benchmark_config::port_init(port_info &info) {
   rxconf = dev_info.default_rxconf;
   rxconf.offloads = port_conf.rxmode.offloads;
   uint16_t idx = 0;
-  for (auto &tb : info.thread_blocks) {
+  uint16_t lcore_id = 0;
+  RTE_LCORE_FOREACH(lcore_id){
+    auto& tb = info.thread_blocks[idx];  
     tb.s_name = std::format("SEND_POOL-{}", idx);
     tb.r_name = std::format("RECV_POOL-{}", idx++);
     auto [send_pool, recv_pool] =
         alloc_pools(role, nb_rx * (nb_rxd + burst_size),
-                    nb_tx * (nb_txd + burst_size), tb.r_name, tb.s_name);
+                    nb_tx * (nb_txd + burst_size), tb.r_name, tb.s_name, lcore_id);
     tb.setup_txqueues(port, nb_tx / nb_threads, nb_txd, txconf, send_pool);
     tb.setup_rxqueues(port, nb_rx / nb_threads, nb_rxd, rxconf, recv_pool);
   }
