@@ -21,11 +21,15 @@ static std::unordered_map<std::string_view, opmode> opmodes{
     {"RECEIVE", opmode::RECEIVE}};
 
 static bool is_sender(opmode role){
-    return role == opmode::FORWARD || role == opmode::PING || role == opmode::PONG;
+    return role == opmode::FORWARD || role == opmode::PING; 
 }
 
 static bool is_receiver(opmode role){
     return role == opmode::RECEIVE || role == opmode::PING || role == opmode::PONG;
+}
+
+static bool forwards_received(opmode role){
+    return role == opmode::PONG;
 }
 
 static std::pair<rte_mempool *, rte_mempool *>
@@ -38,7 +42,7 @@ alloc_pools(opmode role, uint16_t recv_pool_sz, uint16_t send_pool_sz,
                                 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
   if (is_receiver(role))
     pools.second =
-        rte_pktmbuf_pool_create(r_name.data(), recv_pool_sz, MEMPOOL_CACHE_SIZE,
+        rte_pktmbuf_pool_create(r_name.data(), forwards_received(role) ? 2 * recv_pool_sz : recv_pool_sz, MEMPOOL_CACHE_SIZE,
                                 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
   return pools;
 }
