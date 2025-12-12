@@ -59,6 +59,7 @@ void send_rudp(void *port) {
     rudp_peer.submit_rx_burst(rpkts);
     tb.per_thread_submit_stat.submitted += tx_nb;
   }
+  rudp_peer.make_progress();
   auto& stats = rudp_peer.get_stats();
   std::cout << std::format("acked: {}, piggybacked: {}\n", stats.acks, stats.piggybacked) << std::endl;
 }

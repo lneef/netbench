@@ -76,82 +76,6 @@ struct receiver_entry {
   receiver_entry() : seq(0) {}
 };
 
-template <typename T> struct retry_buffer_base {
-  std::vector<T> slots;
-  std::size_t ptr;
-
-  retry_buffer_base(std::size_t entries) : slots(entries, T()), ptr(0) {}
-
-  T &operator[](std::size_t idx) { return slots[idx & (slots.size() - 1)]; }
-
-  T &at(std::size_t idx) { return operator[](idx); }
-};
-
-struct tx_retry_buffer : public retry_buffer_base<sender_entry> {
-
-  tx_retry_buffer(std::size_t entries) : retry_buffer_base(entries) {}
-  template <std::ranges::borrowed_range R>
-  std::size_t prepare_next_n(std::size_t n, R &&range) {
-    auto it = range.begin();
-    auto free_to_use = 0u;
-    n = n & (slots.size() - 1);
-    for (auto i = 0u; i < n; ++i) {
-      auto idx = ptr + i;
-      auto& slot = at(idx);
-      if (slot.requires_retry()) {
-        auto *pkt = slot.get();
-        *(it++) = pkt;
-        pkt_inc_refcnt(pkt);
-      } else {
-        ++free_to_use;
-      }
-    }
-    return free_to_use;
-  }
-
-  uint64_t insert(pkt_t *pkt, uint64_t &seq) {
-    for (;; ++ptr, ++seq)
-      if (!at(ptr).requires_retry()){
-        at(ptr) = {pkt, seq};
-        break;
-      }
-    pkt_inc_refcnt(pkt);
-    return seq;
-  }
-};
-
-struct rx_retry_buffer : public retry_buffer_base<receiver_entry> {
-  rx_retry_buffer(std::size_t size) : retry_buffer_base(size) {}
-};
-
-struct statistics {
-  uint64_t acks;
-  uint64_t piggybacked;
-};
-
-struct ack_buffer {
-  rte_ring *ring;
-  std::string name;
-  ack_buffer(std::size_t size)
-      : ring(rte_ring_create("ACK", size, rte_socket_id_by_idx(rte_lcore_id()),
-                             RING_F_SP_ENQ | RING_F_SC_DEQ)) {}
-  ~ack_buffer() { rte_ring_free(ring); }
-
-  bool enqueue(uint64_t ack) {
-    return rte_ring_enqueue(ring, std::bit_cast<void *>(ack)) == 0;
-  }
-
-  bool dequeue(uint64_t *ack) {
-    return rte_ring_dequeue(ring, reinterpret_cast<void **>(&ack)) == 0;
-  }
-
-  bool empty() { return rte_ring_empty(ring) == 1; }
-
-  std::size_t size() const { return rte_ring_count(ring); }
-
-  std::size_t free() const { return rte_ring_free_count(ring); }
-};
-
 template <typename D> struct pkt_buffer {
   std::vector<pkt_t *> buffer;
   std::size_t head;
@@ -203,8 +127,81 @@ struct rx_free_buffer : pkt_buffer<rx_free_buffer> {
   rx_free_buffer(std::size_t size) : pkt_buffer(size) {}
 };
 
+template <typename T> struct retry_buffer_base {
+  std::vector<T> slots;
+  std::size_t ptr;
+
+  retry_buffer_base(std::size_t entries) : slots(std::bit_ceil(entries), T()), ptr(1) {}
+
+  T &operator[](std::size_t idx) { return slots[idx & (slots.size() - 1)]; }
+
+  T &at(std::size_t idx) { return operator[](idx); }
+};
+
+struct tx_retry_buffer : public retry_buffer_base<sender_entry> {
+
+  tx_retry_buffer(std::size_t entries) : retry_buffer_base(entries) {}
+  std::size_t prepare_next_n(std::size_t n, tx_pkt_buffer& tx_buffer) {
+    auto free_to_use = 0u;
+    n = n & (slots.size() - 1);
+    for (auto i = 0u; i < n; ++i) {
+      auto idx = ptr + i;
+      auto& slot = at(idx);
+      if (slot.requires_retry()) {
+        auto *pkt = slot.get();
+        tx_buffer.push_back(pkt);
+        pkt_inc_refcnt(pkt);
+      } else {
+        ++free_to_use;
+      }
+    }
+    return free_to_use;
+  }
+
+  uint64_t insert(pkt_t *pkt) {
+    for (;; ++ptr)
+      if (!at(ptr).requires_retry()){
+        at(ptr) = {pkt, ptr};
+        break;
+      }
+    pkt_inc_refcnt(pkt);
+    return ptr;
+  }
+};
+
+struct rx_retry_buffer : public retry_buffer_base<receiver_entry> {
+  rx_retry_buffer(std::size_t size) : retry_buffer_base(size) {}
+};
+
+struct statistics {
+  uint64_t acks;
+  uint64_t piggybacked;
+};
+
+struct ack_buffer {
+  rte_ring *ring;
+  std::string name;
+  ack_buffer(std::size_t size)
+      : ring(rte_ring_create("ACK", size, rte_socket_id_by_idx(rte_lcore_id()),
+                             RING_F_SP_ENQ | RING_F_SC_DEQ)) {}
+  ~ack_buffer() { rte_ring_free(ring); }
+
+  bool enqueue(uint64_t ack) {
+    return rte_ring_enqueue(ring, std::bit_cast<void *>(ack)) == 0;
+  }
+
+  bool dequeue(uint64_t *ack) {
+    return rte_ring_dequeue(ring, reinterpret_cast<void **>(&ack)) == 0;
+  }
+
+  bool empty() { return rte_ring_empty(ring) == 1; }
+
+  std::size_t size() const { return rte_ring_count(ring); }
+
+  std::size_t free() const { return rte_ring_free_count(ring); }
+};
+
 struct tx_context : public port_context {
-  uint64_t seq = 1;
   tx_retry_buffer retry_buffer;
   tx_pkt_buffer tx_buffer;
 
@@ -251,7 +248,7 @@ struct peer {
     uint64_t ack = 0;
     auto space = std::min(pkts.size(), tx_ctx.tx_buffer.capacity());
     auto free_to_use =
-        tx_ctx.retry_buffer.prepare_next_n(space, tx_ctx.tx_buffer.span());
+        tx_ctx.retry_buffer.prepare_next_n(space, tx_ctx.tx_buffer);
     auto occupied = tx_ctx.tx_buffer.head;
     for (auto *pkt : pkts.subspan(0, free_to_use)) {
       tx_ctx.tx_buffer.push_back(pkt);
@@ -262,7 +259,7 @@ struct peer {
       }else{
         hdr->ack = 0;
       }
-      hdr->seq = tx_ctx.retry_buffer.insert(pkt, tx_ctx.seq);
+      hdr->seq = tx_ctx.retry_buffer.insert(pkt);
     }
     auto nb_tx =
         rte_eth_tx_burst(tx_ctx.port_id, tx_ctx.qid, tx_ctx.tx_buffer.data(),
