@@ -85,6 +85,7 @@ struct port_info {
   uint16_t port_id;
   aligned_vector<thread_block> thread_blocks;
   capabilities caps;
+  uint32_t max_desc_rxq, max_desv_txq;
   rte_ether_addr addr;
   port_info(): port_id(0) {}
 

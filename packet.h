@@ -27,6 +27,7 @@ public:
   void packet_ipv4_ctor(pkt_t *mbuf, rte_ipv4_hdr *ipv4, uint16_t total_length);
 
   void packet_pp_ctor_udp(pkt_t *mbuf);
+    void packet_pp_ctor_udp(pkt_t *mbuf, std::size_t msg_size);
 
   bool packet_pong_ctor(pkt_t* pkt); 
 

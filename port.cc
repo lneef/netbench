@@ -145,6 +145,8 @@ int benchmark_config::port_init(port_info &info) {
         std::format("Error during getting device info (port {})", port));
   nb_rxd = dev_info.rx_desc_lim.nb_max;
   nb_txd = dev_info.tx_desc_lim.nb_max;
+  info.max_desc_rxq = nb_rxd;
+  info.max_desv_txq = nb_txd;
 
   if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
     port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;

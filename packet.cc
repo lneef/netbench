@@ -51,12 +51,16 @@ void packet_generator::packet_ipv4_ctor(pkt_t *mbuf, struct rte_ipv4_hdr *ipv4, 
 }
 
 void packet_generator::packet_pp_ctor_udp(pkt_t *mbuf) {
+  packet_pp_ctor_udp(mbuf, config.frame_size - HDR_SIZE);  
+}
+
+void packet_generator::packet_pp_ctor_udp(pkt_t *mbuf, std::size_t msg_size) {
   rte_ether_hdr *eth = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
   rte_ipv4_hdr *ipv4 = (struct rte_ipv4_hdr *)(eth + 1);
   rte_udp_hdr *udp = (struct rte_udp_hdr *)(ipv4 + 1);
   mbuf->data_len = 0;
   mbuf->pkt_len = 0;
-  uint32_t payload = config.frame_size - HDR_SIZE;
+  uint32_t payload = msg_size;
   packet_udp_ctor(mbuf, udp, payload += sizeof(struct rte_udp_hdr));
   packet_ipv4_ctor(mbuf, ipv4, payload += sizeof(struct rte_ipv4_hdr));
   packet_eth_ctor(mbuf, eth);
