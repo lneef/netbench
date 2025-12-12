@@ -75,9 +75,9 @@ struct thread_block {
       : per_thread_stat(),
         per_thread_submit_stat() {}
 
-  void setup_rxqueues(uint16_t port, uint16_t nb_rx, uint16_t nb_desc, rte_eth_rxconf &rxconf,
+  void setup_rxqueues(uint16_t port, uint32_t nb_rx, uint16_t nb_desc, rte_eth_rxconf &rxconf,
                      rte_mempool *pool);
-  void setup_txqueues(uint16_t port, uint16_t nb_tx, uint16_t nb_desc, rte_eth_txconf &txconf,
+  void setup_txqueues(uint16_t port, uint32_t nb_tx, uint16_t nb_desc, rte_eth_txconf &txconf,
                      rte_mempool *pool);
 };
 
