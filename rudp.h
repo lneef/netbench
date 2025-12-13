@@ -7,6 +7,7 @@
 #include <cstring>
 #include <generic/rte_cycles.h>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <rte_byteorder.h>
 #include <rte_ethdev.h>
@@ -31,10 +32,15 @@ static bool check_packet(pkt_t *pkt) {
 
 static void pkt_inc_refcnt(pkt_t *pkt) { rte_mbuf_refcnt_update(pkt, 1); }
 
+static __inline uint64_t estimate_latency(uint64_t latency, uint64_t measured) {
+  static constexpr uint64_t w1 = 1, w2 = 7, shift = 3;
+  return (w1 * measured + w2 * latency) >> shift;
+}
+
 #if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
 struct __rte_packed_begin rudp_header {
 #else
-struct rudprudp_header {
+struct rudp_header {
 #endif
   uint64_t ack;
   uint64_t seq;
@@ -54,21 +60,35 @@ struct port_context {
 struct sender_entry {
   pkt_t *packet;
   uint64_t seq;
+  uint64_t ts;
+  uint64_t deadline;
+  sender_entry()
+      : packet(nullptr), seq(0), ts(0), deadline(std::numeric_limits<uint64_t>::max()) {}
+  sender_entry(pkt_t *pkt, uint64_t seq) = delete;
 
-  sender_entry() : packet(nullptr), seq(0) {}
-  sender_entry(pkt_t *pkt, uint64_t seq) : packet(pkt), seq(seq) {}
-
-  bool requires_retry() { return packet != nullptr; }
+  bool requires_retry() { return rte_get_timer_cycles() > deadline; }
+  bool is_free() { return packet == nullptr; }
   pkt_t *get() { return packet; }
 
-  pkt_t *clear_if_valid(uint64_t ack) {
+  pkt_t *clear_if_valid(uint64_t ack, uint64_t &sts) {
     if (ack == seq) {
       auto *pkt = packet;
+      sts = ts;
       packet = nullptr;
-      seq = 0;
+      deadline = std::numeric_limits<uint64_t>::max();
       return pkt;
     }
     return nullptr;
+  }
+
+  void update_ts(uint64_t latency) { 
+      ts = rte_get_timer_cycles();
+      deadline = ts + latency; 
+  }
+
+  void insert(uint64_t latency, auto &&...args) {
+    std::tie(packet, seq) = {args...};
+    update_ts(latency);
   }
 };
 
@@ -134,7 +154,7 @@ template <typename T> struct retry_buffer_base {
   std::size_t ptr;
 
   retry_buffer_base(std::size_t entries)
-      : slots(std::bit_ceil(entries), T()), ptr(1) {}
+      : slots(std::bit_ceil(entries), T()), ptr(0) {}
 
   T &operator[](std::size_t idx) { return slots[idx & (slots.size() - 1)]; }
 
@@ -142,21 +162,26 @@ template <typename T> struct retry_buffer_base {
 };
 
 struct tx_retry_buffer : public retry_buffer_base<sender_entry> {
-
-  tx_retry_buffer(std::size_t entries) : retry_buffer_base(entries) {}
+  uint64_t latency;
+  tx_retry_buffer(std::size_t entries)
+      : retry_buffer_base(entries), latency(rte_get_timer_hz() / 1e6 * 500) {}
 
   std::size_t insert_burst(std::span<pkt_t *> pkts, tx_pkt_buffer &tx_buffer,
                            std::invocable<pkt_t *, uint64_t> auto &&ctor) {
     auto cptr = ptr;
     auto pkt_it = pkts.begin();
-    for (; ptr < cptr + slots.size() && tx_buffer.capacity() > 0; ++ptr) {
+    for (++ptr; ptr < cptr + slots.size() && tx_buffer.capacity() > 0; ++ptr) {
       auto &slot = at(ptr);
       pkt_t *pkt;
-      if (slot.requires_retry()) {
-        pkt = slot.get();
-      } else {
+      if(slot.is_free()){
         pkt = *(pkt_it++);
         ctor(pkt, ptr);
+        slot.insert(latency, pkt, ptr);
+      }else if (slot.requires_retry()) {
+        pkt = slot.get();
+        slot.update_ts(latency);
+      } else {
+          continue;
       }
       tx_buffer.push_back(pkt);
       pkt_inc_refcnt(pkt);
@@ -167,34 +192,28 @@ struct tx_retry_buffer : public retry_buffer_base<sender_entry> {
     return std::distance(pkts.begin(), pkt_it);
   }
 
-  std::size_t prepare_next_n(std::size_t n, tx_pkt_buffer &tx_buffer) {
-    auto free_to_use = 0u;
-    n = n & (slots.size() - 1);
-    for (auto i = 0u; i < ptr + slots.size() && tx_buffer.capacity() > 0; ++i) {
-      auto idx = ptr + i;
-      auto &slot = at(idx);
+  std::size_t prepare_retry(tx_pkt_buffer &tx_buffer, std::size_t n) {
+    auto dec = slots.size() - 1;
+    std::size_t found = 0;
+    n = std::min(n, slots.size());
+    for (uint64_t i = 0; i < n * dec && tx_buffer.capacity() > 0; i += dec) {
+      auto &slot = at(ptr + i);
       if (slot.requires_retry()) {
-        auto *pkt = slot.get();
-        tx_buffer.push_back(pkt);
-        pkt_inc_refcnt(pkt);
-      } else {
-        ++free_to_use;
+        tx_buffer.push_back(slot.get());
+        slot.update_ts(latency);
+        ++found;
       }
-
-      if (free_to_use == n)
-        break;
     }
-    return free_to_use;
+    return found;
   }
 
-  uint64_t insert(pkt_t *pkt) {
-    for (;; ++ptr)
-      if (!at(ptr).requires_retry()) {
-        at(ptr) = {pkt, ptr};
-        break;
-      }
-    pkt_inc_refcnt(pkt);
-    return ptr;
+  pkt_t *acknowledge(uint64_t ack) {
+    uint64_t ts;
+    auto &slot = at(ack);
+    auto *pkt = slot.clear_if_valid(ack, ts);
+    if (pkt)
+      latency = estimate_latency(latency, rte_get_timer_cycles() - ts);
+    return pkt;
   }
 };
 
@@ -205,6 +224,7 @@ struct rx_retry_buffer : public retry_buffer_base<receiver_entry> {
 struct statistics {
   uint64_t acks;
   uint64_t piggybacked;
+  statistics() : acks(0), piggybacked(0) {}
 };
 
 struct ack_buffer {
@@ -220,7 +240,7 @@ struct ack_buffer {
   }
 
   bool dequeue(uint64_t *ack) {
-    return rte_ring_dequeue(ring, reinterpret_cast<void **>(&ack)) == 0;
+    return rte_ring_dequeue(ring, std::bit_cast<void **>(ack)) == 0;
   }
 
   bool empty() { return rte_ring_empty(ring) == 1; }
@@ -295,6 +315,11 @@ struct peer {
     return inserted;
   }
 
+  void retry_last_n(std::size_t n){
+      tx_ctx.retry_buffer.prepare_retry(tx_ctx.tx_buffer, n);
+      submit_tx_burst_posted(tx_ctx.tx_buffer);
+  }
+
   bool make_progress() {
     auto &ack_pool = ack_ctx.ack_pool;
     auto free_ack_buf = tx_ctx.tx_buffer.free_span();
@@ -334,8 +359,7 @@ struct peer {
       auto &retry_buffer = tx_ctx.retry_buffer;
       auto &free_buf = rx_ctx.free_buf;
       auto ack = hdr->ack;
-      auto &slot = retry_buffer[ack];
-      auto *pkt = slot.clear_if_valid(ack);
+      auto *pkt = retry_buffer.acknowledge(ack);
       if (pkt) {
         free_buf.push_back(pkt);
         stats.acks++;
@@ -344,7 +368,7 @@ struct peer {
 
     auto enqueue_ack = [&](rudp_header *hdr, auto &slot) -> bool {
       if (hdr->seq > 0) {
-        bool inserted = false;  
+        bool inserted = false;
         if (slot.seq <= hdr->seq) {
           ack_ctx.acks.enqueue(hdr->seq);
           inserted = slot.seq < hdr->seq;

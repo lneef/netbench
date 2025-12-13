@@ -55,8 +55,11 @@ void send_rudp(void *port) {
       tx_free = 0;
     tx_nb = rudp_peer.submit_tx_burst(std::span(start_it + tx_free, end_it));
     tx_free += tx_nb;
-    sleep(1);
-    rudp_peer.submit_rx_burst(rpkts);
+    uint16_t nb_tx = 0;
+    do{
+        nb_tx += rudp_peer.submit_rx_burst(rpkts);
+        rudp_peer.retry_last_n(1);
+    }while(nb_tx < tx_nb);
     tb.per_thread_submit_stat.submitted += tx_nb;
   }
   rudp_peer.make_progress();
