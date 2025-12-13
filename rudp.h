@@ -6,8 +6,8 @@
 #include <cstdint>
 #include <cstring>
 #include <generic/rte_cycles.h>
+#include <iterator>
 #include <memory>
-#include <ranges>
 #include <rte_byteorder.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
@@ -33,13 +33,14 @@ static void pkt_inc_refcnt(pkt_t *pkt) { rte_mbuf_refcnt_update(pkt, 1); }
 
 #if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
 struct __rte_packed_begin rudp_header {
+#else
+struct rudprudp_header {
+#endif
   uint64_t ack;
   uint64_t seq;
+#if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
 } __rte_packed_end;
 #else
-struct rurudp_header {
-  uint64_t ack;
-  uint64_t seq;
 } __rte_packed;
 #endif
 
@@ -82,9 +83,10 @@ template <typename D> struct pkt_buffer {
 
   pkt_buffer(std::size_t size) : buffer(size), head(0) {}
 
-  std::span<pkt_t *> span() {
+  std::span<pkt_t *> free_span() {
     return std::span(buffer.begin() + head, buffer.end());
   }
+
   void push_back(pkt_t *pkt) { static_cast<D &>(*this).push_back_impl(pkt); }
   std::size_t capacity() { return buffer.size() - head; }
   pkt_t **data() { return buffer.data(); }
@@ -122,7 +124,7 @@ struct rx_free_buffer : pkt_buffer<rx_free_buffer> {
 
   void cleanup_impl(std::size_t size) {
     rte_pktmbuf_free_bulk(buffer.data() + head - size, size);
-    head = size;
+    head -= size;
   }
   rx_free_buffer(std::size_t size) : pkt_buffer(size) {}
 };
@@ -131,7 +133,8 @@ template <typename T> struct retry_buffer_base {
   std::vector<T> slots;
   std::size_t ptr;
 
-  retry_buffer_base(std::size_t entries) : slots(std::bit_ceil(entries), T()), ptr(1) {}
+  retry_buffer_base(std::size_t entries)
+      : slots(std::bit_ceil(entries), T()), ptr(1) {}
 
   T &operator[](std::size_t idx) { return slots[idx & (slots.size() - 1)]; }
 
@@ -141,12 +144,35 @@ template <typename T> struct retry_buffer_base {
 struct tx_retry_buffer : public retry_buffer_base<sender_entry> {
 
   tx_retry_buffer(std::size_t entries) : retry_buffer_base(entries) {}
-  std::size_t prepare_next_n(std::size_t n, tx_pkt_buffer& tx_buffer) {
+
+  std::size_t insert_burst(std::span<pkt_t *> pkts, tx_pkt_buffer &tx_buffer,
+                           std::invocable<pkt_t *, uint64_t> auto &&ctor) {
+    auto cptr = ptr;
+    auto pkt_it = pkts.begin();
+    for (; ptr < cptr + slots.size() && tx_buffer.capacity() > 0; ++ptr) {
+      auto &slot = at(ptr);
+      pkt_t *pkt;
+      if (slot.requires_retry()) {
+        pkt = slot.get();
+      } else {
+        pkt = *(pkt_it++);
+        ctor(pkt, ptr);
+      }
+      tx_buffer.push_back(pkt);
+      pkt_inc_refcnt(pkt);
+
+      if (pkt_it == pkts.end())
+        break;
+    }
+    return std::distance(pkts.begin(), pkt_it);
+  }
+
+  std::size_t prepare_next_n(std::size_t n, tx_pkt_buffer &tx_buffer) {
     auto free_to_use = 0u;
     n = n & (slots.size() - 1);
-    for (auto i = 0u; i < n; ++i) {
+    for (auto i = 0u; i < ptr + slots.size() && tx_buffer.capacity() > 0; ++i) {
       auto idx = ptr + i;
-      auto& slot = at(idx);
+      auto &slot = at(idx);
       if (slot.requires_retry()) {
         auto *pkt = slot.get();
         tx_buffer.push_back(pkt);
@@ -154,13 +180,16 @@ struct tx_retry_buffer : public retry_buffer_base<sender_entry> {
       } else {
         ++free_to_use;
       }
+
+      if (free_to_use == n)
+        break;
     }
     return free_to_use;
   }
 
   uint64_t insert(pkt_t *pkt) {
     for (;; ++ptr)
-      if (!at(ptr).requires_retry()){
+      if (!at(ptr).requires_retry()) {
         at(ptr) = {pkt, ptr};
         break;
       }
@@ -214,11 +243,11 @@ struct tx_context : public port_context {
 struct rx_context : public port_context {
   rx_free_buffer free_buf;
   rx_retry_buffer retry_buffer;
-  packet_generator& pg;
+  packet_generator &pg;
   rx_context(uint16_t port_id, uint16_t qid, int64_t entries,
-             std::size_t threshold, packet_generator& pg)
-      : port_context(port_id, qid), free_buf(threshold), retry_buffer(entries), pg(pg) {
-  }
+             std::size_t threshold, packet_generator &pg)
+      : port_context(port_id, qid), free_buf(threshold), retry_buffer(entries),
+        pg(pg) {}
 };
 
 struct ack_context {
@@ -236,55 +265,51 @@ struct peer {
   ack_context ack_ctx;
   statistics stats;
 
-  peer(uint16_t port_id, uint16_t txq, uint16_t rxq, uint64_t entries, std::size_t tx_buffer_size,
-       std::shared_ptr<rte_mempool> pool, packet_generator& pg)
+  peer(uint16_t port_id, uint16_t txq, uint16_t rxq, uint64_t entries,
+       std::size_t tx_buffer_size, std::shared_ptr<rte_mempool> pool,
+       packet_generator &pg)
       : tx_ctx(port_id, txq, entries, tx_buffer_size),
         rx_ctx(port_id, rxq, entries, MEMPOOL_CACHE_SIZE, pg),
         ack_ctx(pool, entries), stats() {}
 
-  const statistics& get_stats() const { return stats; }
+  const statistics &get_stats() const { return stats; }
 
   uint16_t submit_tx_burst(std::span<pkt_t *> pkts) {
     uint64_t ack = 0;
-    auto space = std::min(pkts.size(), tx_ctx.tx_buffer.capacity());
-    auto free_to_use =
-        tx_ctx.retry_buffer.prepare_next_n(space, tx_ctx.tx_buffer);
-    auto occupied = tx_ctx.tx_buffer.head;
-    for (auto *pkt : pkts.subspan(0, free_to_use)) {
-      tx_ctx.tx_buffer.push_back(pkt);
+    auto ctor = [&](pkt_t *pkt, uint64_t seq) {
       auto *hdr = rte_pktmbuf_mtod_offset(pkt, rudp_header *, HDR_SIZE);
-      if (ack_ctx.acks.dequeue(&ack)){
+      hdr->seq = seq;
+      if (ack_ctx.acks.dequeue(&ack)) {
         hdr->ack = ack;
         stats.piggybacked++;
-      }else{
+      } else {
         hdr->ack = 0;
       }
-      hdr->seq = tx_ctx.retry_buffer.insert(pkt);
-    }
+    };
+    auto inserted =
+        tx_ctx.retry_buffer.insert_burst(pkts, tx_ctx.tx_buffer, ctor);
     auto nb_tx =
         rte_eth_tx_burst(tx_ctx.port_id, tx_ctx.qid, tx_ctx.tx_buffer.data(),
                          tx_ctx.tx_buffer.head);
     tx_ctx.tx_buffer.cleanup(nb_tx);
-    if (nb_tx > occupied)
-      nb_tx -= occupied;
-    else
-      nb_tx = 0;
-    return nb_tx;
+    return inserted;
   }
 
   bool make_progress() {
     auto &ack_pool = ack_ctx.ack_pool;
-    auto free_ack_buf = tx_ctx.tx_buffer.span();
+    auto free_ack_buf = tx_ctx.tx_buffer.free_span();
+    auto free_for_acks = free_ack_buf.size();
+    free_for_acks = std::min(free_for_acks, ack_ctx.acks.size());
     uint64_t ack;
     if (rte_pktmbuf_alloc_bulk(ack_pool.get(), free_ack_buf.data(),
-                               free_ack_buf.size())) {
+                               free_for_acks)) {
       rte_eth_tx_done_cleanup(tx_ctx.port_id, tx_ctx.qid, free_ack_buf.size());
       if (rte_pktmbuf_alloc_bulk(ack_pool.get(), free_ack_buf.data(),
-                                 free_ack_buf.size()))
+                                 free_for_acks))
         return false;
     }
 
-    for (auto *pkt : free_ack_buf) {
+    for (auto *pkt : free_ack_buf.subspan(0, free_for_acks)) {
       rx_ctx.pg.packet_pp_ctor_udp(pkt);
       rx_ctx.pg.packet_ipv4_udp_cksum(pkt);
       auto *hdr = rte_pktmbuf_mtod_offset(pkt, rudp_header *, HDR_SIZE);
@@ -293,7 +318,8 @@ struct peer {
       hdr->ack = ack;
     }
 
-    auto tx_nb = submit_tx_burst_posted(free_ack_buf);
+    tx_ctx.tx_buffer.mark_as_used(free_for_acks);
+    auto tx_nb = submit_tx_burst_posted(tx_ctx.tx_buffer);
     tx_ctx.tx_buffer.cleanup(tx_nb);
     return true;
   }
@@ -310,7 +336,7 @@ struct peer {
       auto ack = hdr->ack;
       auto &slot = retry_buffer[ack];
       auto *pkt = slot.clear_if_valid(ack);
-      if (pkt){
+      if (pkt) {
         free_buf.push_back(pkt);
         stats.acks++;
       }
