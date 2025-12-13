@@ -344,11 +344,13 @@ struct peer {
 
     auto enqueue_ack = [&](rudp_header *hdr, auto &slot) -> bool {
       if (hdr->seq > 0) {
-        if (hdr->seq <= slot.seq) {
+        bool inserted = false;  
+        if (slot.seq <= hdr->seq) {
           ack_ctx.acks.enqueue(hdr->seq);
+          inserted = slot.seq < hdr->seq;
           slot.seq = hdr->seq;
         }
-        return slot.seq < hdr->seq;
+        return inserted;
       }
       return false;
     };
