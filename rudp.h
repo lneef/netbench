@@ -9,6 +9,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <ranges>
 #include <rte_byteorder.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
@@ -62,11 +63,15 @@ struct sender_entry {
   uint64_t seq;
   uint64_t ts;
   uint64_t deadline;
+  bool passed_to_nic;
   sender_entry()
-      : packet(nullptr), seq(0), ts(0), deadline(std::numeric_limits<uint64_t>::max()) {}
+      : packet(nullptr), seq(0), ts(0),
+        deadline(std::numeric_limits<uint64_t>::max()), passed_to_nic(false) {}
   sender_entry(pkt_t *pkt, uint64_t seq) = delete;
 
-  bool requires_retry() { return rte_get_timer_cycles() > deadline; }
+  bool requires_retry() {
+    return passed_to_nic && rte_get_timer_cycles() > deadline;
+  }
   bool is_free() { return packet == nullptr; }
   pkt_t *get() { return packet; }
 
@@ -81,15 +86,17 @@ struct sender_entry {
     return nullptr;
   }
 
-  void update_ts(uint64_t latency) { 
-      ts = rte_get_timer_cycles();
-      deadline = ts + latency; 
+  void update_ts(uint64_t latency) {
+    ts = rte_get_timer_cycles();
+    deadline = ts + latency;
   }
 
   void insert(uint64_t latency, auto &&...args) {
     std::tie(packet, seq) = {args...};
     update_ts(latency);
   }
+
+  void set_passed_to_nic() { passed_to_nic = true; }
 };
 
 struct receiver_entry {
@@ -173,15 +180,15 @@ struct tx_retry_buffer : public retry_buffer_base<sender_entry> {
     for (++ptr; ptr < cptr + slots.size() && tx_buffer.capacity() > 0; ++ptr) {
       auto &slot = at(ptr);
       pkt_t *pkt;
-      if(slot.is_free()){
+      if (slot.is_free()) {
         pkt = *(pkt_it++);
         ctor(pkt, ptr);
         slot.insert(latency, pkt, ptr);
-      }else if (slot.requires_retry()) {
+      } else if (slot.requires_retry()) {
         pkt = slot.get();
         slot.update_ts(latency);
       } else {
-          continue;
+        continue;
       }
       tx_buffer.push_back(pkt);
       pkt_inc_refcnt(pkt);
@@ -214,6 +221,13 @@ struct tx_retry_buffer : public retry_buffer_base<sender_entry> {
     if (pkt)
       latency = estimate_latency(latency, rte_get_timer_cycles() - ts);
     return pkt;
+  }
+
+  void set_passed_to_nic(std::span<pkt_t *> pkts) {
+    std::ranges::for_each(pkts, [&](pkt_t *pkt) {
+      auto *hdr = rte_pktmbuf_mtod_offset(pkt, rudp_header *, HDR_SIZE);
+      at(hdr->seq).set_passed_to_nic();
+    });
   }
 };
 
@@ -311,13 +325,14 @@ struct peer {
     auto nb_tx =
         rte_eth_tx_burst(tx_ctx.port_id, tx_ctx.qid, tx_ctx.tx_buffer.data(),
                          tx_ctx.tx_buffer.head);
+    tx_ctx.retry_buffer.set_passed_to_nic(pkts.subspan(0, nb_tx));
     tx_ctx.tx_buffer.cleanup(nb_tx);
     return inserted;
   }
 
-  void retry_last_n(std::size_t n){
-      tx_ctx.retry_buffer.prepare_retry(tx_ctx.tx_buffer, n);
-      submit_tx_burst_posted(tx_ctx.tx_buffer);
+  void retry_last_n(std::size_t n) {
+    tx_ctx.retry_buffer.prepare_retry(tx_ctx.tx_buffer, n);
+    submit_tx_burst_posted(tx_ctx.tx_buffer);
   }
 
   bool make_progress() {
