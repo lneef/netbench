@@ -38,13 +38,42 @@ static __inline uint64_t estimate_latency(uint64_t latency, uint64_t measured) {
   return (w1 * measured + w2 * latency) >> shift;
 }
 
+enum class MessageType : uint16_t {
+    NORMAL_PKT = 0, ACK_BURST = 1,
+};
+
 #if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
-struct __rte_packed_begin rudp_header {
+struct __rte_packed_begin rudp_header_base {
 #else
-struct rudp_header {
+struct rudp_header_base {
+#endif
+    MessageType op;
+#if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
+} __rte_packed_end;
+#else
+} __rte_packed;
+#endif
+
+#if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
+struct __rte_packed_begin rudp_header : public rudp_header_base{
+#else
+struct rudp_header : public rudp_header_base{
 #endif
   uint64_t ack;
   uint64_t seq;
+#if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
+} __rte_packed_end;
+#else
+} __rte_packed;
+#endif
+
+#if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
+struct __rte_packed_begin rudp_ack_header : public rudp_header_base{
+#else
+struct rudp_ack_header : public rrudp_header_base{
+#endif
+  uint64_t num;
+  uint64_t acks[];
 #if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
 } __rte_packed_end;
 #else
@@ -79,8 +108,10 @@ struct sender_entry {
     if (ack == seq) {
       auto *pkt = packet;
       sts = ts;
+      seq = 0;
       packet = nullptr;
       deadline = std::numeric_limits<uint64_t>::max();
+      passed_to_nic = false;
       return pkt;
     }
     return nullptr;
@@ -129,6 +160,8 @@ template <typename D> struct pkt_buffer {
 struct tx_pkt_buffer : pkt_buffer<tx_pkt_buffer> {
 
   void cleanup_impl(std::size_t sent) {
+    if(sent == 0)
+        return;
     auto nhead = 0;
     auto begin = buffer.begin();
     for (auto *pkt : std::span(begin + sent, begin + head))
@@ -161,7 +194,7 @@ template <typename T> struct retry_buffer_base {
   std::size_t ptr;
 
   retry_buffer_base(std::size_t entries)
-      : slots(std::bit_ceil(entries), T()), ptr(0) {}
+      : slots(std::bit_ceil(entries), T()), ptr(1) {}
 
   T &operator[](std::size_t idx) { return slots[idx & (slots.size() - 1)]; }
 
@@ -177,12 +210,13 @@ struct tx_retry_buffer : public retry_buffer_base<sender_entry> {
                            std::invocable<pkt_t *, uint64_t> auto &&ctor) {
     auto cptr = ptr;
     auto pkt_it = pkts.begin();
-    for (++ptr; ptr < cptr + slots.size() && tx_buffer.capacity() > 0; ++ptr) {
+    for (; pkt_it != pkts.end() && tx_buffer.capacity() > 0 && ptr < cptr + slots.size(); ++ptr) {
       auto &slot = at(ptr);
       pkt_t *pkt;
       if (slot.is_free()) {
         pkt = *(pkt_it++);
         ctor(pkt, ptr);
+        pkt_inc_refcnt(pkt);
         slot.insert(latency, pkt, ptr);
       } else if (slot.requires_retry()) {
         pkt = slot.get();
@@ -191,10 +225,6 @@ struct tx_retry_buffer : public retry_buffer_base<sender_entry> {
         continue;
       }
       tx_buffer.push_back(pkt);
-      pkt_inc_refcnt(pkt);
-
-      if (pkt_it == pkts.end())
-        break;
     }
     return std::distance(pkts.begin(), pkt_it);
   }
@@ -312,6 +342,7 @@ struct peer {
     uint64_t ack = 0;
     auto ctor = [&](pkt_t *pkt, uint64_t seq) {
       auto *hdr = rte_pktmbuf_mtod_offset(pkt, rudp_header *, HDR_SIZE);
+      hdr->op = MessageType::NORMAL_PKT;
       hdr->seq = seq;
       if (ack_ctx.acks.dequeue(&ack)) {
         hdr->ack = ack;
@@ -325,14 +356,16 @@ struct peer {
     auto nb_tx =
         rte_eth_tx_burst(tx_ctx.port_id, tx_ctx.qid, tx_ctx.tx_buffer.data(),
                          tx_ctx.tx_buffer.head);
-    tx_ctx.retry_buffer.set_passed_to_nic(pkts.subspan(0, nb_tx));
+    auto begin = tx_ctx.tx_buffer.begin();
+    tx_ctx.retry_buffer.set_passed_to_nic(std::span(begin, begin + nb_tx));
     tx_ctx.tx_buffer.cleanup(nb_tx);
     return inserted;
   }
 
   void retry_last_n(std::size_t n) {
     tx_ctx.retry_buffer.prepare_retry(tx_ctx.tx_buffer, n);
-    submit_tx_burst_posted(tx_ctx.tx_buffer);
+    auto tx_nb = submit_tx_burst_posted(tx_ctx.tx_buffer);
+    tx_ctx.tx_buffer.cleanup(tx_nb);
   }
 
   bool make_progress() {
@@ -381,8 +414,9 @@ struct peer {
       }
     };
 
-    auto enqueue_ack = [&](rudp_header *hdr, auto &slot) -> bool {
+    auto enqueue_ack = [&](rudp_header *hdr) -> bool {
       if (hdr->seq > 0) {
+        auto &slot = rx_ctx.retry_buffer[hdr->seq];
         bool inserted = false;
         if (slot.seq <= hdr->seq) {
           ack_ctx.acks.enqueue(hdr->seq);
@@ -405,9 +439,10 @@ struct peer {
       if (hdr->ack > 0)
         process_ack(hdr);
       pkts[j] = pkts[i];
-      auto &slot = rx_ctx.retry_buffer[hdr->seq];
-      if (enqueue_ack(hdr, slot))
+      if (enqueue_ack(hdr))
         ++j;
+      else
+          rte_pktmbuf_free(pkts[i]);
     }
     return j;
   }

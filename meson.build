@@ -15,10 +15,10 @@ sources_pong = files('pong.cc',
   'packet.cc',
   'port.cc',
   'util.cc')
-sources_pong = files('rudp.cc',
+sources_rudp = files('rudp.cc',
   'packet.cc',
   'port.cc',
   'util.cc')
 executable('dpdk-ping', sources_ping, dependencies: dpdk_dep, link_args: ['-lcap', '-Wl,--allow-multiple-definition', '-Wl,--whole-archive'])
 executable('dpdk-pong', sources_pong, dependencies: dpdk_dep, link_args: ['-lcap', '-Wl,--allow-multiple-definition', '-Wl,--whole-archive'])
-executable('dpdk-rudp', sources_pong, dependencies: dpdk_dep, link_args: ['-lcap', '-Wl,--allow-multiple-definition', '-Wl,--whole-archive'])
+executable('dpdk-rudp', sources_rudp, dependencies: dpdk_dep, link_args: ['-lcap', '-Wl,--allow-multiple-definition', '-Wl,--whole-archive'])
