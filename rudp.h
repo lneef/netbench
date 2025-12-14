@@ -70,7 +70,7 @@ struct rudp_header : public rudp_header_base{
 #if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
 struct __rte_packed_begin rudp_ack_header : public rudp_header_base{
 #else
-struct rudp_ack_header : public rrudp_header_base{
+struct rudp_ack_header : public rudp_header_base{
 #endif
   uint64_t num;
   uint64_t acks[];
