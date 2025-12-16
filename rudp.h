@@ -2,15 +2,16 @@
 #define RUDP_H
 #include <algorithm>
 #include <bit>
+#include <cassert>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <generic/rte_cycles.h>
-#include <iterator>
+#include <deque>
 #include <limits>
 #include <memory>
-#include <ranges>
 #include <rte_byteorder.h>
+#include <rte_cycles.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
 #include <rte_lcore.h>
@@ -21,25 +22,16 @@
 #include <rte_ring.h>
 #include <rte_ring_core.h>
 #include <span>
+#include <tuple>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "packet.h"
-#include "port.h"
-
-static bool check_packet(pkt_t *pkt) {
-  auto *eth = rte_pktmbuf_mtod(pkt, rte_ether_hdr *);
-  return eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
-}
-
-static void pkt_inc_refcnt(pkt_t *pkt) { rte_mbuf_refcnt_update(pkt, 1); }
-
-static __inline uint64_t estimate_latency(uint64_t latency, uint64_t measured) {
-  static constexpr uint64_t w1 = 1, w2 = 7, shift = 3;
-  return (w1 * measured + w2 * latency) >> shift;
-}
 
 enum class MessageType : uint16_t {
-    NORMAL_PKT = 0, ACK_BURST = 1,
+  NORMAL_PKT = 0,
+  ACK_BURST = 1,
 };
 
 #if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
@@ -47,7 +39,7 @@ struct __rte_packed_begin rudp_header_base {
 #else
 struct rudp_header_base {
 #endif
-    MessageType op;
+  MessageType op;
 #if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
 } __rte_packed_end;
 #else
@@ -55,9 +47,9 @@ struct rudp_header_base {
 #endif
 
 #if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
-struct __rte_packed_begin rudp_header : public rudp_header_base{
+struct __rte_packed_begin rudp_header : public rudp_header_base {
 #else
-struct rudp_header : public rudp_header_base{
+struct rudp_header : public rudp_header_base {
 #endif
   uint64_t ack;
   uint64_t seq;
@@ -67,13 +59,15 @@ struct rudp_header : public rudp_header_base{
 } __rte_packed;
 #endif
 
+struct ack_buffer;
 #if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
-struct __rte_packed_begin rudp_ack_header : public rudp_header_base{
+struct __rte_packed_begin rudp_ack_header : public rudp_header_base {
 #else
-struct rudp_ack_header : public rudp_header_base{
+struct rudp_ack_header : public rudp_header_base {
 #endif
   uint64_t num;
   uint64_t acks[];
+  uint64_t construct_bulk_ack(uint64_t num, ack_buffer &queue);
 #if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
 } __rte_packed_end;
 #else
@@ -87,20 +81,48 @@ struct port_context {
   port_context(uint16_t port_id, uint16_t qid) : port_id(port_id), qid(qid) {}
 };
 
+static bool check_packet(pkt_t *pkt) {
+  auto *eth = rte_pktmbuf_mtod(pkt, rte_ether_hdr *);
+  return eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+}
+
+static void pkt_inc_refcnt(pkt_t *pkt) { rte_mbuf_refcnt_update(pkt, 1); }
+
+static __inline std::pair<uint64_t, uint64_t>
+estimate_timeout(uint64_t rtt, uint64_t rtt_dv, uint64_t measured) {
+  static constexpr uint64_t w1 = 1, w2 = 7, shift = 3;
+  auto nrtt = (w1 * measured + w2 * rtt) >> shift;
+  auto diff = measured > rtt ? measured - rtt : rtt - measured;
+  auto nrtt_dv = (w1 * diff + w2 * rtt_dv) >> shift;
+  return {nrtt, nrtt_dv};
+}
+
+static __inline std::size_t deque_pop_bulk(std::deque<uint64_t> &queue,
+                                           rudp_ack_header *hdr,
+                                           std::size_t length) {
+  auto nb = std::min(queue.size(), length);
+  for (auto i = 0u; i < nb; ++i) {
+    hdr->acks[i] = queue.back();
+    queue.pop_back();
+  }
+  return nb;
+}
+
 struct sender_entry {
   pkt_t *packet;
   uint64_t seq;
   uint64_t ts;
   uint64_t deadline;
-  bool passed_to_nic;
+  bool retransmitted;
   sender_entry()
       : packet(nullptr), seq(0), ts(0),
-        deadline(std::numeric_limits<uint64_t>::max()), passed_to_nic(false) {}
-  sender_entry(pkt_t *pkt, uint64_t seq) = delete;
+        deadline(std::numeric_limits<uint64_t>::max()), retransmitted(false) {}
+  sender_entry(pkt_t *packet, uint64_t seq, uint64_t ts, uint64_t deadline,
+               bool retransmitted)
+      : packet(packet), seq(seq), ts(ts), deadline(deadline),
+        retransmitted(retransmitted) {}
 
-  bool requires_retry() {
-    return passed_to_nic && rte_get_timer_cycles() > deadline;
-  }
+  bool requires_retry() { return rte_get_timer_cycles() > deadline; }
   bool is_free() { return packet == nullptr; }
   pkt_t *get() { return packet; }
 
@@ -108,10 +130,7 @@ struct sender_entry {
     if (ack == seq) {
       auto *pkt = packet;
       sts = ts;
-      seq = 0;
-      packet = nullptr;
-      deadline = std::numeric_limits<uint64_t>::max();
-      passed_to_nic = false;
+      new (this) sender_entry{};
       return pkt;
     }
     return nullptr;
@@ -121,13 +140,6 @@ struct sender_entry {
     ts = rte_get_timer_cycles();
     deadline = ts + latency;
   }
-
-  void insert(uint64_t latency, auto &&...args) {
-    std::tie(packet, seq) = {args...};
-    update_ts(latency);
-  }
-
-  void set_passed_to_nic() { passed_to_nic = true; }
 };
 
 struct receiver_entry {
@@ -160,8 +172,8 @@ template <typename D> struct pkt_buffer {
 struct tx_pkt_buffer : pkt_buffer<tx_pkt_buffer> {
 
   void cleanup_impl(std::size_t sent) {
-    if(sent == 0)
-        return;
+    if (sent == 0)
+      return;
     auto nhead = 0;
     auto begin = buffer.begin();
     for (auto *pkt : std::span(begin + sent, begin + head))
@@ -174,95 +186,225 @@ struct tx_pkt_buffer : pkt_buffer<tx_pkt_buffer> {
   tx_pkt_buffer(std::size_t size) : pkt_buffer(size) {}
 };
 
-struct rx_free_buffer : pkt_buffer<rx_free_buffer> {
-
-  void push_back_impl(pkt_t *pkt) {
-    if (head == buffer.size())
-      cleanup_impl(head);
-    buffer[head++] = pkt;
-  }
-
-  void cleanup_impl(std::size_t size) {
-    rte_pktmbuf_free_bulk(buffer.data() + head - size, size);
-    head -= size;
-  }
-  rx_free_buffer(std::size_t size) : pkt_buffer(size) {}
-};
-
 template <typename T> struct retry_buffer_base {
   std::vector<T> slots;
   std::size_t ptr;
 
   retry_buffer_base(std::size_t entries)
-      : slots(std::bit_ceil(entries), T()), ptr(1) {}
+      : slots(std::bit_ceil(entries), T()), ptr(0) {}
 
   T &operator[](std::size_t idx) { return slots[idx & (slots.size() - 1)]; }
 
   T &at(std::size_t idx) { return operator[](idx); }
 };
 
-struct tx_retry_buffer : public retry_buffer_base<sender_entry> {
-  uint64_t latency;
-  tx_retry_buffer(std::size_t entries)
-      : retry_buffer_base(entries), latency(rte_get_timer_hz() / 1e6 * 500) {}
+// Adapated from
+// https://github.com/google/quiche/blob/fe3e5329dd01b7ba87caf2cc5c4f7ebb82e4cbd7/quiche/common/quiche_circular_deque.h#L222
+template <typename T> class IndexableQueue {
+public:
+  using reference = std::vector<T>::reference;
+
+  reference operator[](std::size_t i) { return memory[i & mask]; }
+
+  IndexableQueue(std::size_t size)
+      : memory(std::bit_ceil(size)), head(0), tail(0), mask(memory.size() - 1) {
+  }
+
+  void emplace_front(auto &&...args) {
+    if (full())
+      resize();
+    if constexpr (std::is_aggregate_v<T>) {
+      new (&memory[head]) T(args...);
+    } else {
+      memory[head] = std::get<0>(std::forward_as_tuple(args...));
+    }
+    head = (head + 1) & mask;
+  }
+
+  reference back() { return memory[tail]; }
+
+  void pop_back() { tail = (tail + 1) & mask; }
+
+  bool empty() const { return head == tail; }
+  std::size_t size() const { return (head + memory.size() - tail) & mask; }
+
+protected:
+  void resize() {
+    auto osize = memory.size();
+    auto nsize = 2 * osize;
+
+    std::vector<T> nmemory(nsize);
+    auto begin = memory.begin();
+    auto nbegin = nmemory.begin();
+    if (tail > head) {
+      std::copy(begin + tail, begin + head, nbegin + tail);
+    } else {
+      auto begin = memory.begin();
+      std::copy(begin, begin + head, nbegin + memory.size());
+      std::copy(begin + tail, begin + memory.size(), nmemory.begin() + tail);
+    }
+    memory = std::move(nmemory);
+    head += osize;
+    mask = nsize - 1;
+  }
+
+  bool full() const { return ((head + 1) & mask) == tail; }
+
+  std::vector<T> memory;
+  std::size_t head, tail;
+  std::size_t mask;
+};
+
+struct AckStore : public IndexableQueue<bool> {
+  AckStore(std::size_t size) : IndexableQueue(size) {}
+};
+
+class window {
+public:
+  using reference = std::vector<bool>::reference;
+  window(std::size_t size) : wd(size), lb(0), ub(size - 1), least_in_window(0) {}
+
+  reference operator[](std::size_t idx) { return wd[index(idx)]; }
+
+  bool set_and_advance(std::size_t ack_seq) {
+    auto i = index(ack_seq);
+    if (inside(ack_seq) && wd[i])
+      return false;
+    add(ack_seq);
+    wd[i] = true;
+    advance<>();
+    return true;
+  }
+
+  void add(uint64_t seq) {
+    seq -= least_in_window;
+    if (seq > mask)
+      resize();
+  }
+
+  bool outside(uint64_t seq) {
+    return seq < least_in_window || seq > least_in_window + mask;
+  }
+
+  template <bool body = false>
+  void advance(std::invocable<uint64_t> auto &&...f) {
+    assert(mask + 1 == wd.size());
+    assert(lb == (least_in_window & mask));
+    while (wd[lb]) {
+      lb = (lb + 1) & mask;
+      ub = (lb + 1) & mask;
+      wd[ub] = false;
+      (f(least_in_window), ...);
+      ++least_in_window;
+    }
+  }
+
+private:
+  bool inside(uint64_t seq) {
+    return seq >= least_in_window && seq <= least_in_window + mask;
+  }
+
+  std::size_t __inline index(std::size_t i) { return (i - least_in_window + lb) & mask; }
+
+  void resize() {
+    auto osize = wd.size();
+    auto nsize = osize * 2;
+    std::vector<bool> nwd(nsize);
+    auto begin = wd.begin();
+    auto nbegin = nwd.begin();
+    std::copy(begin + lb, wd.end(), nbegin + lb);
+    if (ub < lb)
+      std::copy(begin, begin + ub + 1, nbegin + osize);
+    mask = nsize - 1;
+  }
+
+  std::vector<bool> wd;
+  std::size_t lb, ub;
+  std::size_t mask;
+  uint64_t least_in_window;
+};
+
+struct retransmission_handler {
+  std::deque<sender_entry> unacked_packets;
+  window ackstore;
+  uint64_t seq;
+  uint64_t rtt;
+  uint64_t rtt_dv;
+  uint64_t timeout;
+  uint64_t least_not_acked;
+  uint64_t largest_sent;
+  uint64_t last_resend_pkt;
+
+  retransmission_handler(std::size_t window_size)
+      : ackstore(window_size), seq(0), rtt(rte_get_timer_hz()),
+        rtt_dv(rte_get_timer_hz()), least_not_acked(0), largest_sent(0),
+        last_resend_pkt(0) {}
+
+  void cleanup_window() {
+    auto now = rte_get_timer_cycles();
+    ackstore.advance([&](uint64_t seq) {
+      assert(!unacked_packets.empty());
+      auto &desc = unacked_packets.front();
+      assert(desc.seq == seq);
+      if (!desc.retransmitted) {
+        std::tie(rtt, rtt_dv) = estimate_timeout(rtt, rtt_dv, now - desc.ts);
+        timeout = rtt_dv * 4 + rtt;
+      }
+      ++least_not_acked;
+      rte_pktmbuf_free(desc.packet);
+      unacked_packets.pop_front();
+    });
+  }
 
   std::size_t insert_burst(std::span<pkt_t *> pkts, tx_pkt_buffer &tx_buffer,
                            std::invocable<pkt_t *, uint64_t> auto &&ctor) {
-    auto cptr = ptr;
-    auto pkt_it = pkts.begin();
-    for (; pkt_it != pkts.end() && tx_buffer.capacity() > 0 && ptr < cptr + slots.size(); ++ptr) {
-      auto &slot = at(ptr);
-      pkt_t *pkt;
-      if (slot.is_free()) {
-        pkt = *(pkt_it++);
-        ctor(pkt, ptr);
-        pkt_inc_refcnt(pkt);
-        slot.insert(latency, pkt, ptr);
-      } else if (slot.requires_retry()) {
-        pkt = slot.get();
-        slot.update_ts(latency);
-      } else {
-        continue;
-      }
-      tx_buffer.push_back(pkt);
+    probe_retransmit(tx_buffer, tx_buffer.capacity());
+    auto space = std::min(tx_buffer.capacity(), pkts.size());
+    for (auto *pkt : pkts.subspan(0, space)) {
+      pkt_inc_refcnt(pkt);
+      largest_sent = seq;
+      ctor(pkt, seq++);
+      ackstore.add(largest_sent);
+      auto ts = rte_get_timer_cycles();
+      last_resend_pkt = 0;
+      unacked_packets.emplace_back(pkt, seq, ts, ts + timeout, false);
     }
-    return std::distance(pkts.begin(), pkt_it);
+    return space;
   }
 
-  std::size_t prepare_retry(tx_pkt_buffer &tx_buffer, std::size_t n) {
-    auto dec = slots.size() - 1;
-    std::size_t found = 0;
-    n = std::min(n, slots.size());
-    for (uint64_t i = 0; i < n * dec && tx_buffer.capacity() > 0; i += dec) {
-      auto &slot = at(ptr + i);
-      if (slot.requires_retry()) {
-        tx_buffer.push_back(slot.get());
-        slot.update_ts(latency);
-        ++found;
-      }
+  std::size_t probe_retransmit(tx_pkt_buffer &tx_buffer, std::size_t n) {
+    assert(last_resend_pkt < unacked_packets.size());
+    auto found = 0u, i = 0u;
+    auto it = unacked_packets.begin() + last_resend_pkt,
+         end = unacked_packets.end();
+    for (; it != end && i < n; ++it, ++i) {
+      auto &desc = *it;
+      if (!desc.requires_retry() || ackstore[desc.seq])
+        break;
+      desc.update_ts(timeout);
+      desc.retransmitted = true;
+      tx_buffer.push_back(desc.packet);
+      pkt_inc_refcnt(desc.packet);
+      ++last_resend_pkt;
+      ++found;
     }
     return found;
   }
 
-  pkt_t *acknowledge(uint64_t ack) {
-    uint64_t ts;
-    auto &slot = at(ack);
-    auto *pkt = slot.clear_if_valid(ack, ts);
-    if (pkt)
-      latency = estimate_latency(latency, rte_get_timer_cycles() - ts);
-    return pkt;
+  void acknowledge(uint64_t seq) {
+    acknowledge_fast(seq);
+    cleanup_window();
   }
 
-  void set_passed_to_nic(std::span<pkt_t *> pkts) {
-    std::ranges::for_each(pkts, [&](pkt_t *pkt) {
-      auto *hdr = rte_pktmbuf_mtod_offset(pkt, rudp_header *, HDR_SIZE);
-      at(hdr->seq).set_passed_to_nic();
-    });
+  void acknowledge_fast(uint64_t seq) {
+    if (seq > largest_sent || seq < least_not_acked)
+      return;
+    ackstore[seq - least_not_acked] = true;
   }
-};
 
-struct rx_retry_buffer : public retry_buffer_base<receiver_entry> {
-  rx_retry_buffer(std::size_t size) : retry_buffer_base(size) {}
+  bool is_acked(uint64_t seq) {
+    return seq < least_not_acked || (seq <= largest_sent && ackstore[seq]);
+  }
 };
 
 struct statistics {
@@ -271,31 +413,8 @@ struct statistics {
   statistics() : acks(0), piggybacked(0) {}
 };
 
-struct ack_buffer {
-  rte_ring *ring;
-  std::string name;
-  ack_buffer(std::size_t size)
-      : ring(rte_ring_create("ACK", size, rte_socket_id_by_idx(rte_lcore_id()),
-                             RING_F_SP_ENQ | RING_F_SC_DEQ)) {}
-  ~ack_buffer() { rte_ring_free(ring); }
-
-  bool enqueue(uint64_t ack) {
-    return rte_ring_enqueue(ring, std::bit_cast<void *>(ack)) == 0;
-  }
-
-  bool dequeue(uint64_t *ack) {
-    return rte_ring_dequeue(ring, std::bit_cast<void **>(ack)) == 0;
-  }
-
-  bool empty() { return rte_ring_empty(ring) == 1; }
-
-  std::size_t size() const { return rte_ring_count(ring); }
-
-  std::size_t free() const { return rte_ring_free_count(ring); }
-};
-
 struct tx_context : public port_context {
-  tx_retry_buffer retry_buffer;
+  retransmission_handler retry_buffer;
   tx_pkt_buffer tx_buffer;
 
   tx_context(uint16_t port_id, uint16_t qid, std::size_t retry_size,
@@ -305,18 +424,16 @@ struct tx_context : public port_context {
 };
 
 struct rx_context : public port_context {
-  rx_free_buffer free_buf;
-  rx_retry_buffer retry_buffer;
   packet_generator &pg;
+  window recv_wd;
   rx_context(uint16_t port_id, uint16_t qid, int64_t entries,
-             std::size_t threshold, packet_generator &pg)
-      : port_context(port_id, qid), free_buf(threshold), retry_buffer(entries),
-        pg(pg) {}
+             packet_generator &pg)
+      : port_context(port_id, qid), pg(pg), recv_wd(entries) {}
 };
 
 struct ack_context {
   std::shared_ptr<rte_mempool> ack_pool;
-  ack_buffer acks;
+  std::deque<uint64_t> acks;
   uint64_t last_ack;
   ack_context(std::shared_ptr<rte_mempool> pool, uint64_t size)
       : ack_pool(std::move(pool)), acks(size),
@@ -333,19 +450,18 @@ struct peer {
        std::size_t tx_buffer_size, std::shared_ptr<rte_mempool> pool,
        packet_generator &pg)
       : tx_ctx(port_id, txq, entries, tx_buffer_size),
-        rx_ctx(port_id, rxq, entries, MEMPOOL_CACHE_SIZE, pg),
-        ack_ctx(pool, entries), stats() {}
+        rx_ctx(port_id, rxq, entries, pg), ack_ctx(pool, entries), stats() {}
 
   const statistics &get_stats() const { return stats; }
 
   uint16_t submit_tx_burst(std::span<pkt_t *> pkts) {
-    uint64_t ack = 0;
     auto ctor = [&](pkt_t *pkt, uint64_t seq) {
       auto *hdr = rte_pktmbuf_mtod_offset(pkt, rudp_header *, HDR_SIZE);
       hdr->op = MessageType::NORMAL_PKT;
       hdr->seq = seq;
-      if (ack_ctx.acks.dequeue(&ack)) {
-        hdr->ack = ack;
+      if (!ack_ctx.acks.empty()) {
+        hdr->ack = ack_ctx.acks.back();
+        ack_ctx.acks.pop_back();
         stats.piggybacked++;
       } else {
         hdr->ack = 0;
@@ -356,14 +472,13 @@ struct peer {
     auto nb_tx =
         rte_eth_tx_burst(tx_ctx.port_id, tx_ctx.qid, tx_ctx.tx_buffer.data(),
                          tx_ctx.tx_buffer.head);
-    auto begin = tx_ctx.tx_buffer.begin();
-    tx_ctx.retry_buffer.set_passed_to_nic(std::span(begin, begin + nb_tx));
     tx_ctx.tx_buffer.cleanup(nb_tx);
     return inserted;
   }
 
   void retry_last_n(std::size_t n) {
-    tx_ctx.retry_buffer.prepare_retry(tx_ctx.tx_buffer, n);
+    tx_ctx.retry_buffer.probe_retransmit(
+        tx_ctx.tx_buffer, std::min(n, tx_ctx.tx_buffer.capacity()));
     auto tx_nb = submit_tx_burst_posted(tx_ctx.tx_buffer);
     tx_ctx.tx_buffer.cleanup(tx_nb);
   }
@@ -373,25 +488,24 @@ struct peer {
     auto free_ack_buf = tx_ctx.tx_buffer.free_span();
     auto free_for_acks = free_ack_buf.size();
     free_for_acks = std::min(free_for_acks, ack_ctx.acks.size());
-    uint64_t ack;
-    if (rte_pktmbuf_alloc_bulk(ack_pool.get(), free_ack_buf.data(),
-                               free_for_acks)) {
-      rte_eth_tx_done_cleanup(tx_ctx.port_id, tx_ctx.qid, free_ack_buf.size());
-      if (rte_pktmbuf_alloc_bulk(ack_pool.get(), free_ack_buf.data(),
-                                 free_for_acks))
-        return false;
-    }
-
-    for (auto *pkt : free_ack_buf.subspan(0, free_for_acks)) {
-      rx_ctx.pg.packet_pp_ctor_udp(pkt);
+    auto total_acks = ack_ctx.acks.size();
+    uint64_t processed = 0;
+    uint16_t buffers_used = 0;
+    for (auto &pkt : free_ack_buf.subspan(0, free_for_acks)) {
+      pkt = rte_pktmbuf_alloc(ack_pool.get());
+      auto *hdr = rte_pktmbuf_mtod_offset(pkt, rudp_ack_header *, HDR_SIZE);
+      auto space = (pkt->buf_len - HDR_SIZE) / sizeof(uint64_t);
+      auto num = deque_pop_bulk(ack_ctx.acks, hdr, space);
+      rx_ctx.pg.packet_pp_ctor_udp(pkt, num * sizeof(uint64_t) +
+                                            sizeof(rudp_ack_header));
       rx_ctx.pg.packet_ipv4_udp_cksum(pkt);
-      auto *hdr = rte_pktmbuf_mtod_offset(pkt, rudp_header *, HDR_SIZE);
-      hdr->seq = 0;
-      ack_ctx.acks.dequeue(&ack);
-      hdr->ack = ack;
+      processed += num;
+      ++buffers_used;
+      if (processed == total_acks)
+        break;
     }
 
-    tx_ctx.tx_buffer.mark_as_used(free_for_acks);
+    tx_ctx.tx_buffer.mark_as_used(buffers_used);
     auto tx_nb = submit_tx_burst_posted(tx_ctx.tx_buffer);
     tx_ctx.tx_buffer.cleanup(tx_nb);
     return true;
@@ -405,44 +519,47 @@ struct peer {
   uint16_t submit_rx_burst(std::span<pkt_t *> pkts) {
     auto process_ack = [&](rudp_header *hdr) {
       auto &retry_buffer = tx_ctx.retry_buffer;
-      auto &free_buf = rx_ctx.free_buf;
       auto ack = hdr->ack;
-      auto *pkt = retry_buffer.acknowledge(ack);
-      if (pkt) {
-        free_buf.push_back(pkt);
-        stats.acks++;
-      }
+      retry_buffer.acknowledge(ack);
     };
 
-    auto enqueue_ack = [&](rudp_header *hdr) -> bool {
-      if (hdr->seq > 0) {
-        auto &slot = rx_ctx.retry_buffer[hdr->seq];
-        bool inserted = false;
-        if (slot.seq <= hdr->seq) {
-          ack_ctx.acks.enqueue(hdr->seq);
-          inserted = slot.seq < hdr->seq;
-          slot.seq = hdr->seq;
-        }
-        return inserted;
-      }
-      return false;
+    auto process_seq = [&](rudp_header *hdr) -> bool {
+      if (rx_ctx.recv_wd.outside(hdr->seq))
+        return false;
+      else
+        return rx_ctx.recv_wd.set_and_advance(hdr->seq);
     };
     uint16_t rcvd =
         rte_eth_rx_burst(rx_ctx.port_id, rx_ctx.qid, pkts.data(), pkts.size());
     uint16_t i, j;
     for (i = 0, j = 0; i < rcvd; ++i) {
       if (!check_packet(pkts[i])) {
-        rx_ctx.free_buf.push_back(pkts[i]);
+        rte_pktmbuf_free(pkts[i]);
         continue;
       }
-      auto *hdr = rte_pktmbuf_mtod_offset(pkts[i], rudp_header *, HDR_SIZE);
-      if (hdr->ack > 0)
-        process_ack(hdr);
-      pkts[j] = pkts[i];
-      if (enqueue_ack(hdr))
-        ++j;
-      else
+      auto *hdr =
+          rte_pktmbuf_mtod_offset(pkts[i], rudp_header_base *, HDR_SIZE);
+      switch (hdr->op) {
+      case MessageType::NORMAL_PKT: {
+        auto *nhdr = static_cast<rudp_header *>(hdr);
+        if (nhdr->ack)
+          process_ack(nhdr);
+        pkts[j] = pkts[i];
+        ack_ctx.acks.push_front(nhdr->seq);
+        if (process_seq(nhdr))
+          ++j;
+        else
           rte_pktmbuf_free(pkts[i]);
+
+        break;
+      }
+      case MessageType::ACK_BURST: {
+        auto ahdr = static_cast<rudp_ack_header *>(hdr);
+        for (auto i = 0u; i < ahdr->num; ++i)
+          tx_ctx.retry_buffer.acknowledge(ahdr->acks[i]);
+        break;
+      }
+      }
     }
     return j;
   }
