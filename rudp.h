@@ -262,7 +262,7 @@ struct AckStore : public IndexableQueue<bool> {
 class window {
 public:
   using reference = std::vector<bool>::reference;
-  window(std::size_t size) : wd(size), lb(0), ub(size - 1), least_in_window(0) {}
+  window(std::size_t size, uint64_t min_seq) : wd(size), lb(0), ub(size - 1), least_in_window(min_seq) {}
 
   reference operator[](std::size_t idx) { return wd[index(idx)]; }
 
@@ -272,7 +272,7 @@ public:
       return false;
     add(ack_seq);
     wd[i] = true;
-    advance<>();
+    advance();
     return true;
   }
 
@@ -282,21 +282,26 @@ public:
       resize();
   }
 
+  bool acked(uint64_t seq) {
+      return inside(seq) && wd[index(seq)];
+  }
+
   bool outside(uint64_t seq) {
     return seq < least_in_window || seq > least_in_window + mask;
   }
 
-  template <bool body = false>
   void advance(std::invocable<uint64_t> auto &&...f) {
     assert(mask + 1 == wd.size());
-    assert(lb == (least_in_window & mask));
+    assert(lb == ((least_in_window - 1) & mask));
     while (wd[lb]) {
       lb = (lb + 1) & mask;
-      ub = (lb + 1) & mask;
+      ub = (ub + 1) & mask;
       wd[ub] = false;
       (f(least_in_window), ...);
       ++least_in_window;
     }
+
+    assert(((lb + mask) & mask) == ub);
   }
 
 private:
@@ -316,6 +321,7 @@ private:
     if (ub < lb)
       std::copy(begin, begin + ub + 1, nbegin + osize);
     mask = nsize - 1;
+    wd = std::move(nwd);
   }
 
   std::vector<bool> wd;
@@ -325,6 +331,7 @@ private:
 };
 
 struct retransmission_handler {
+  static constexpr uint64_t min_seq = 1;  
   std::deque<sender_entry> unacked_packets;
   window ackstore;
   uint64_t seq;
@@ -333,12 +340,10 @@ struct retransmission_handler {
   uint64_t timeout;
   uint64_t least_not_acked;
   uint64_t largest_sent;
-  uint64_t last_resend_pkt;
 
   retransmission_handler(std::size_t window_size)
-      : ackstore(window_size), seq(0), rtt(rte_get_timer_hz()),
-        rtt_dv(rte_get_timer_hz()), least_not_acked(0), largest_sent(0),
-        last_resend_pkt(0) {}
+      : ackstore(window_size, min_seq), seq(min_seq), rtt(rte_get_timer_hz()),
+        rtt_dv(rte_get_timer_hz()), least_not_acked(0), largest_sent(0) {}
 
   void cleanup_window() {
     auto now = rte_get_timer_cycles();
@@ -361,31 +366,29 @@ struct retransmission_handler {
     probe_retransmit(tx_buffer, tx_buffer.capacity());
     auto space = std::min(tx_buffer.capacity(), pkts.size());
     for (auto *pkt : pkts.subspan(0, space)) {
-      pkt_inc_refcnt(pkt);
       largest_sent = seq;
-      ctor(pkt, seq++);
+      ctor(pkt, seq);
       ackstore.add(largest_sent);
+      tx_buffer.push_back(pkt);
+      pkt_inc_refcnt(pkt);
       auto ts = rte_get_timer_cycles();
-      last_resend_pkt = 0;
-      unacked_packets.emplace_back(pkt, seq, ts, ts + timeout, false);
+      unacked_packets.emplace_back(pkt, seq++, ts, ts + timeout, false);
     }
     return space;
   }
 
   std::size_t probe_retransmit(tx_pkt_buffer &tx_buffer, std::size_t n) {
-    assert(last_resend_pkt < unacked_packets.size());
     auto found = 0u, i = 0u;
-    auto it = unacked_packets.begin() + last_resend_pkt,
+    auto it = unacked_packets.begin(),
          end = unacked_packets.end();
     for (; it != end && i < n; ++it, ++i) {
       auto &desc = *it;
-      if (!desc.requires_retry() || ackstore[desc.seq])
+      if (ackstore.acked(desc.seq) || !desc.requires_retry())
         break;
       desc.update_ts(timeout);
       desc.retransmitted = true;
       tx_buffer.push_back(desc.packet);
       pkt_inc_refcnt(desc.packet);
-      ++last_resend_pkt;
       ++found;
     }
     return found;
@@ -428,7 +431,7 @@ struct rx_context : public port_context {
   window recv_wd;
   rx_context(uint16_t port_id, uint16_t qid, int64_t entries,
              packet_generator &pg)
-      : port_context(port_id, qid), pg(pg), recv_wd(entries) {}
+      : port_context(port_id, qid), pg(pg), recv_wd(entries, 1) {}
 };
 
 struct ack_context {
