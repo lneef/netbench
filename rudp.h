@@ -186,108 +186,39 @@ struct tx_pkt_buffer : pkt_buffer<tx_pkt_buffer> {
   tx_pkt_buffer(std::size_t size) : pkt_buffer(size) {}
 };
 
-template <typename T> struct retry_buffer_base {
-  std::vector<T> slots;
-  std::size_t ptr;
-
-  retry_buffer_base(std::size_t entries)
-      : slots(std::bit_ceil(entries), T()), ptr(0) {}
-
-  T &operator[](std::size_t idx) { return slots[idx & (slots.size() - 1)]; }
-
-  T &at(std::size_t idx) { return operator[](idx); }
-};
-
-// Adapated from
-// https://github.com/google/quiche/blob/fe3e5329dd01b7ba87caf2cc5c4f7ebb82e4cbd7/quiche/common/quiche_circular_deque.h#L222
-template <typename T> class IndexableQueue {
-public:
-  using reference = std::vector<T>::reference;
-
-  reference operator[](std::size_t i) { return memory[i & mask]; }
-
-  IndexableQueue(std::size_t size)
-      : memory(std::bit_ceil(size)), head(0), tail(0), mask(memory.size() - 1) {
-  }
-
-  void emplace_front(auto &&...args) {
-    if (full())
-      resize();
-    if constexpr (std::is_aggregate_v<T>) {
-      new (&memory[head]) T(args...);
-    } else {
-      memory[head] = std::get<0>(std::forward_as_tuple(args...));
-    }
-    head = (head + 1) & mask;
-  }
-
-  reference back() { return memory[tail]; }
-
-  void pop_back() { tail = (tail + 1) & mask; }
-
-  bool empty() const { return head == tail; }
-  std::size_t size() const { return (head + memory.size() - tail) & mask; }
-
-protected:
-  void resize() {
-    auto osize = memory.size();
-    auto nsize = 2 * osize;
-
-    std::vector<T> nmemory(nsize);
-    auto begin = memory.begin();
-    auto nbegin = nmemory.begin();
-    if (tail > head) {
-      std::copy(begin + tail, begin + head, nbegin + tail);
-    } else {
-      auto begin = memory.begin();
-      std::copy(begin, begin + head, nbegin + memory.size());
-      std::copy(begin + tail, begin + memory.size(), nmemory.begin() + tail);
-    }
-    memory = std::move(nmemory);
-    head += osize;
-    mask = nsize - 1;
-  }
-
-  bool full() const { return ((head + 1) & mask) == tail; }
-
-  std::vector<T> memory;
-  std::size_t head, tail;
-  std::size_t mask;
-};
-
-struct AckStore : public IndexableQueue<bool> {
-  AckStore(std::size_t size) : IndexableQueue(size) {}
-};
-
 class window {
 public:
   using reference = std::vector<bool>::reference;
-  window(std::size_t size, uint64_t min_seq) : wd(size), lb(0), ub(size - 1), least_in_window(min_seq) {}
+  window(std::size_t size, uint64_t min_seq)
+      : wd(size), lb(0), ub(size - 1), least_in_window(min_seq) {}
 
   reference operator[](std::size_t idx) { return wd[index(idx)]; }
 
   bool set_and_advance(std::size_t ack_seq) {
     auto i = index(ack_seq);
-    if (inside(ack_seq) && wd[i])
+    if (!inside(ack_seq) || wd[i])
       return false;
-    add(ack_seq);
     wd[i] = true;
     advance();
     return true;
   }
 
-  void add(uint64_t seq) {
+  bool add(uint64_t seq) {
+    assert(seq >= least_in_window);
     seq -= least_in_window;
     if (seq > mask)
+#ifdef RESIZE
       resize();
+#else
+      return false;
+#endif
+    return true;
   }
 
-  bool acked(uint64_t seq) {
-      return inside(seq) && wd[index(seq)];
-  }
+  bool acked(uint64_t seq) { return inside(seq) && wd[index(seq)]; }
 
   bool outside(uint64_t seq) {
-    return seq < least_in_window || seq > least_in_window + mask;
+    return !inside(seq);
   }
 
   void advance(std::invocable<uint64_t> auto &&...f) {
@@ -300,7 +231,6 @@ public:
       (f(least_in_window), ...);
       ++least_in_window;
     }
-
     assert(((lb + mask) & mask) == ub);
   }
 
@@ -309,7 +239,10 @@ private:
     return seq >= least_in_window && seq <= least_in_window + mask;
   }
 
-  std::size_t __inline index(std::size_t i) { return (i - least_in_window + lb) & mask; }
+  std::size_t __inline index(std::size_t i) {
+    assert(i >= least_in_window);
+    return (i - least_in_window + lb) & mask;
+  }
 
   void resize() {
     auto osize = wd.size();
@@ -331,7 +264,7 @@ private:
 };
 
 struct retransmission_handler {
-  static constexpr uint64_t min_seq = 1;  
+  static constexpr uint64_t min_seq = 1;
   std::deque<sender_entry> unacked_packets;
   window ackstore;
   uint64_t seq;
@@ -365,22 +298,24 @@ struct retransmission_handler {
                            std::invocable<pkt_t *, uint64_t> auto &&ctor) {
     probe_retransmit(tx_buffer, tx_buffer.capacity());
     auto space = std::min(tx_buffer.capacity(), pkts.size());
+    auto nb = 0;
     for (auto *pkt : pkts.subspan(0, space)) {
+      if (!ackstore.add(seq))
+        break;
+      ++nb;
       largest_sent = seq;
       ctor(pkt, seq);
-      ackstore.add(largest_sent);
       tx_buffer.push_back(pkt);
       pkt_inc_refcnt(pkt);
       auto ts = rte_get_timer_cycles();
       unacked_packets.emplace_back(pkt, seq++, ts, ts + timeout, false);
     }
-    return space;
+    return nb;
   }
 
-  std::size_t probe_retransmit(tx_pkt_buffer &tx_buffer, std::size_t n) {
-    auto found = 0u, i = 0u;
-    auto it = unacked_packets.begin(),
-         end = unacked_packets.end();
+  void probe_retransmit(tx_pkt_buffer &tx_buffer, std::size_t n) {
+    auto i = 0u;
+    auto it = unacked_packets.begin(), end = unacked_packets.end();
     for (; it != end && i < n; ++it, ++i) {
       auto &desc = *it;
       if (ackstore.acked(desc.seq) || !desc.requires_retry())
@@ -389,9 +324,7 @@ struct retransmission_handler {
       desc.retransmitted = true;
       tx_buffer.push_back(desc.packet);
       pkt_inc_refcnt(desc.packet);
-      ++found;
     }
-    return found;
   }
 
   void acknowledge(uint64_t seq) {
@@ -402,7 +335,7 @@ struct retransmission_handler {
   void acknowledge_fast(uint64_t seq) {
     if (seq > largest_sent || seq < least_not_acked)
       return;
-    ackstore[seq - least_not_acked] = true;
+    ackstore[seq] = true;
   }
 
   bool is_acked(uint64_t seq) {
