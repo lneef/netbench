@@ -199,10 +199,9 @@ public:
   reference operator[](std::size_t idx) { return wd[index(idx)]; }
 
   bool set_and_advance(std::size_t ack_seq) {
-    auto i = index(ack_seq);
-    if (!inside(ack_seq) || wd[i])
+    if (!inside(ack_seq) || wd[index(ack_seq)])
       return false;
-    wd[i] = true;
+    wd[index(ack_seq)] = true;
     advance();
     return true;
   }
