@@ -7,7 +7,6 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
-#include <generic/rte_cycles.h>
 #include <limits>
 #include <memory>
 #include <rte_byteorder.h>
