@@ -71,10 +71,16 @@ bool packet_generator::packet_pong_ctor(pkt_t* pkt) {
   struct rte_ether_hdr *eth = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
   struct rte_ipv4_hdr *ipv4 = (struct rte_ipv4_hdr *)(eth + 1);
   struct rte_udp_hdr *udp = (struct rte_udp_hdr *)(ipv4 + 1);
+  assert(pkt->packet_type & RTE_PTYPE_L3_IPV4);
+  assert(pkt->packet_type & RTE_PTYPE_L4_UDP);
   if (!packet_verify_cksum(pkt)) {
-    rte_log(RTE_LOG_INFO, RTE_LOGTYPE_USER1, "invalid udp checksum\n");
+    rte_log(RTE_LOG_INFO, RTE_LOGTYPE_USER1, "invalid checksum\n");
     return false;
   }
+  pkt->l2_len = sizeof(rte_ether_hdr);
+  pkt->l3_len = sizeof(rte_ipv4_hdr);
+  pkt->l4_len = sizeof(rte_udp_hdr);
+  pkt->ol_flags = 0;
   udp->dgram_cksum = 0;
   ipv4->hdr_checksum = 0;
   ipv4->time_to_live = TTL;
