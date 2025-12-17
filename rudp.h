@@ -278,10 +278,8 @@ struct retransmission_handler {
         rtt_dv(rte_get_timer_hz()), timeout(rtt + 4 * rtt_dv) {}
 
   void cleanup_acked_pkts(uint64_t seq) {
-    assert(!unacked_packets.empty());
-
     auto now = rte_get_timer_cycles();
-    while (unacked_packets.front().seq <= seq) {
+    while (!unacked_packets.empty() && unacked_packets.front().seq <= seq) {
       auto &desc = unacked_packets.front();
       if (desc.seq > seq)
         return;
@@ -424,6 +422,7 @@ struct peer {
   bool make_progress() {
     static constexpr std::size_t hdr_space = HDR_SIZE + sizeof(rudp_ack_header);
     auto &ack_pool = ack_ctx.ack_pool;
+    assert(ack_pool.get());
     auto free_ack_buf = tx_ctx.tx_buffer.free_span();
     auto free_for_acks = free_ack_buf.size();
     free_for_acks = std::min(free_for_acks, ack_ctx.acks.size());
