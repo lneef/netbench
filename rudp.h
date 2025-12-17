@@ -17,6 +17,8 @@
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
 
+#include <format>
+#include <iostream>
 #include <rte_mbuf_core.h>
 #include <rte_mempool.h>
 #include <rte_ring.h>
@@ -25,8 +27,6 @@
 #include <tuple>
 #include <utility>
 #include <vector>
-#include <format>
-#include <iostream>
 
 #include "packet.h"
 
@@ -129,14 +129,14 @@ struct sender_entry {
   bool is_free() { return packet == nullptr; }
   pkt_t *get() { return packet; }
 
-  sender_entry(const sender_entry&) = delete;
-  sender_entry(sender_entry&& other){
-      packet = other.packet;
-      seq = other.seq;
-      ts = other.ts;
-      deadline = other.deadline;
-      retransmitted = other.retransmitted;
-      other.packet = nullptr;
+  sender_entry(const sender_entry &) = delete;
+  sender_entry(sender_entry &&other) {
+    packet = other.packet;
+    seq = other.seq;
+    ts = other.ts;
+    deadline = other.deadline;
+    retransmitted = other.retransmitted;
+    other.packet = nullptr;
   }
 
   void update_ts(uint64_t latency) {
@@ -147,7 +147,7 @@ struct sender_entry {
 
 struct receiver_entry {
   uint64_t seq;
-receiver_entry() : seq(0) {}
+  receiver_entry() : seq(0) {}
 };
 
 template <typename D> struct pkt_buffer {
@@ -193,14 +193,14 @@ class window {
 public:
   using reference = std::vector<bool>::reference;
   window(std::size_t size, uint64_t min_seq)
-      : wd(size), lb(0), ub(size - 1), mask(size - 1),
-        least_in_window(min_seq), last_resize(rte_get_timer_cycles()) {}
+      : wd(size), lb(0), ub(size - 1), mask(size - 1), least_in_window(min_seq),
+        last_resize(rte_get_timer_cycles()) {}
 
   reference operator[](std::size_t idx) { return wd[index(idx)]; }
 
-  bool set_and_advance(std::size_t ack_seq) {
-    assert(inside(ack_seq));  
-    auto i = index(ack_seq);  
+  bool set_and_advance(std::size_t seq) {
+    assert(inside(seq));
+    auto i = index(seq);
     if (wd[i])
       return false;
     wd[i] = true;
@@ -225,7 +225,7 @@ public:
            (seq <= least_in_window + mask && wd[index(seq)]);
   }
 
-  bool outside(uint64_t seq) { return !inside(seq); }
+  bool beyond_window(uint64_t seq) { return seq > least_in_window + mask; }
 
   void advance(std::invocable<uint64_t> auto &&...f) {
     assert(mask + 1 == wd.size());
@@ -251,8 +251,8 @@ private:
   }
 
   void resize(uint64_t rto) {
-    if(last_resize + 2 * rto > rte_get_timer_cycles())
-        return;
+    if (last_resize + 2 * rto > rte_get_timer_cycles())
+      return;
     auto osize = wd.size();
     auto nsize = osize * 2;
     std::vector<bool> nwd(nsize);
@@ -272,14 +272,8 @@ private:
   uint64_t last_resize;
 };
 
-struct retransmission_handler {
-  std::deque<sender_entry> unacked_packets;
-  window ackstore;
-  uint64_t seq;
-  uint64_t rtt;
-  uint64_t rtt_dv;
-  uint64_t timeout;
-
+class retransmission_handler {
+public:
   retransmission_handler(std::size_t window_size)
       : ackstore(window_size, min_seq), seq(min_seq), rtt(rte_get_timer_hz()),
         rtt_dv(rte_get_timer_hz()), timeout(rtt + 4 * rtt_dv) {}
@@ -326,7 +320,7 @@ struct retransmission_handler {
       auto &desc = unacked_packets.front();
       if (ackstore.acked(desc.seq) || !desc.requires_retry())
         break;
-      desc.update_ts(2 * timeout);
+      desc.update_ts(timeout);
       desc.retransmitted = true;
       tx_buffer.push_back(desc.packet);
       pkt_inc_refcnt(desc.packet);
@@ -336,20 +330,21 @@ struct retransmission_handler {
   }
 
   void acknowledge(uint64_t seq) {
-    acknowledge_fast(seq);
+    if (!ackstore.inside(seq))
+      return;
+    ackstore[seq] = true;
     cleanup_window();
   }
 
-  void acknowledge_up_to(uint64_t seq){
-      cleanup_acked_pkts(seq);
-  }
-
-  void acknowledge_fast(uint64_t seq) {
-    if (ackstore.inside(seq))
-      ackstore[seq] = true;
-  }
-
   bool is_acked(uint64_t seq) { return ackstore.acked(seq); }
+
+private:
+  std::deque<sender_entry> unacked_packets;
+  window ackstore;
+  uint64_t seq;
+  uint64_t rtt;
+  uint64_t rtt_dv;
+  uint64_t timeout;
 };
 
 struct statistics {
@@ -366,6 +361,8 @@ struct tx_context : public port_context {
              std::size_t tx_size)
       : port_context(port_id, qid), retry_buffer(retry_size),
         tx_buffer(tx_size) {}
+
+  void process_ack(uint64_t ack) { retry_buffer.acknowledge(ack); }
 };
 
 struct rx_context : public port_context {
@@ -374,6 +371,11 @@ struct rx_context : public port_context {
   rx_context(uint16_t port_id, uint16_t qid, int64_t entries,
              packet_generator &pg)
       : port_context(port_id, qid), pg(pg), recv_wd(entries, min_seq) {}
+  bool process_seq(uint64_t seq) {
+    if (recv_wd.acked(seq) || recv_wd.beyond_window(seq))
+      return false;
+    return recv_wd.set_and_advance(seq);
+  }
 };
 
 struct ack_context {
@@ -398,11 +400,13 @@ struct peer {
 
   uint16_t submit_tx_burst(std::span<pkt_t *> pkts) {
 #ifndef NDEBUG
-      rte_eth_stats dev_stats;
-      rte_eth_stats_get(tx_ctx.port_id, &dev_stats);
-      std::cerr << std::format("errors: {}, packets: {}, bytes: {} \n", dev_stats.oerrors, dev_stats.opackets, dev_stats.obytes);
+    rte_eth_stats dev_stats;
+    rte_eth_stats_get(tx_ctx.port_id, &dev_stats);
+    std::cerr << std::format("errors: {}, packets: {}, bytes: {} \n",
+                             dev_stats.oerrors, dev_stats.opackets,
+                             dev_stats.obytes);
 #endif
-        auto ctor = [&](pkt_t *pkt, uint64_t seq) {
+    auto ctor = [&](pkt_t *pkt, uint64_t seq) {
       auto *hdr = rte_pktmbuf_mtod_offset(pkt, rudp_header *, HDR_SIZE);
       hdr->op = MessageType::NORMAL_PKT;
       hdr->seq = seq;
@@ -438,8 +442,8 @@ struct peer {
     auto free_for_acks = free_ack_buf.size();
     free_for_acks = std::min(free_for_acks, ack_ctx.acks.size());
     auto total_acks = ack_ctx.acks.size();
-    if(total_acks == 0)
-        return false;
+    if (total_acks == 0)
+      return false;
     uint64_t processed = 0;
     uint16_t buffers_used = 0;
     for (auto &pkt : free_ack_buf.subspan(0, free_for_acks)) {
@@ -468,11 +472,6 @@ struct peer {
   }
 
   uint16_t submit_rx_burst(std::span<pkt_t *> pkts) {
-    auto process_seq = [&](rudp_header *hdr) -> bool {
-        if(!rx_ctx.recv_wd.inside(hdr->seq))
-            return false;
-        return rx_ctx.recv_wd.set_and_advance(hdr->seq);
-    };
     uint16_t rcvd =
         rte_eth_rx_burst(rx_ctx.port_id, rx_ctx.qid, pkts.data(), pkts.size());
     uint16_t i, j;
@@ -487,20 +486,19 @@ struct peer {
       case MessageType::NORMAL_PKT: {
         auto *nhdr = static_cast<rudp_header *>(hdr);
         if (nhdr->ack)
-            tx_ctx.retry_buffer.acknowledge(nhdr->ack);
+          tx_ctx.process_ack(nhdr->ack);
         pkts[j] = pkts[i];
         ack_ctx.acks.push_front(nhdr->seq);
-        if (process_seq(nhdr))
+        if (rx_ctx.process_seq(nhdr->seq))
           ++j;
         else
           rte_pktmbuf_free(pkts[i]);
-
         break;
       }
       case MessageType::ACK_BURST: {
-        auto ahdr = static_cast<rudp_ack_header *>(hdr);
+        auto *ahdr = static_cast<rudp_ack_header *>(hdr);
         for (auto i = 0u; i < ahdr->num; ++i)
-          tx_ctx.retry_buffer.acknowledge(ahdr->acks[i]);
+          tx_ctx.process_ack(ahdr->acks[i]);
         break;
       }
       }
