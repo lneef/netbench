@@ -17,13 +17,13 @@
 #include <span>
 
 #include <arpa/inet.h>
+#include <iostream>
 #include <rte_memcpy.h>
 #include <rte_mempool.h>
 #include <rte_udp.h>
 #include <stdalign.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <iostream>
 
 #include "packet.h"
 #include "port.h"
@@ -31,15 +31,18 @@
 #include "statistics.h"
 #include "util.h"
 
-
 void send_rudp(void *port) {
   auto &[info, config] = *static_cast<lcore_adapter *>(port);
   auto &tb = info.local();
 
   packet_generator pg(info.caps, info, config);
-  peer rudp_peer{
-      info.port_id,      tb.tx_queues.front(),     tb.rx_queues.front(),
-      info.max_desv_txq, 2ull * config.burst_size, tb.send_pool, pg};
+  peer rudp_peer{info.port_id,
+                 tb.tx_queues.front(),
+                 tb.rx_queues.front(),
+                 info.max_desv_txq,
+                 2ull * config.burst_size,
+                 tb.send_pool,
+                 pg};
 
   uint16_t tx_free = config.burst_size, tx_nb;
   std::vector<pkt_t *> pkts(tx_free);
@@ -55,16 +58,19 @@ void send_rudp(void *port) {
       tx_free = 0;
     tx_nb = rudp_peer.submit_tx_burst(std::span(start_it + tx_free, end_it));
     tx_free += tx_nb;
-    uint16_t nb_tx = 0;
-    do{
-        nb_tx += rudp_peer.submit_rx_burst(rpkts);
-        rudp_peer.retry_last_n(1);
-    }while(nb_tx < tx_nb);
+    uint16_t nb_rx = 0;
+    do {
+      nb_rx += rudp_peer.submit_rx_burst(rpkts);
+    } while (nb_rx < tx_nb);
+    rte_pktmbuf_free_bulk(rpkts.data(), nb_rx);
     tb.per_thread_submit_stat.submitted += tx_nb;
   }
   rudp_peer.make_progress();
-  auto& stats = rudp_peer.get_stats();
-  std::cout << std::format("acked: {}, piggybacked: {}\n", stats.acks, stats.piggybacked) << std::endl;
+  auto stats = rudp_peer.get_stats();
+  std::cout << std::format(
+                   "acked: {}, retransmitted: {}, sent: {}, rtt: {:2}\n",
+                   stats.acked, stats.retransmitted, stats.sent, stats.rtt)
+            << std::endl;
 }
 
 void recv_rudp(void *port) {
@@ -72,9 +78,13 @@ void recv_rudp(void *port) {
   auto &tb = info.local();
 
   packet_generator pg(info.caps, info, config);
-  peer rudp_peer{
-      info.port_id,      tb.tx_queues.front(),     tb.rx_queues.front(),
-      info.max_desv_txq, 2ull * config.burst_size, tb.send_pool, pg};
+  peer rudp_peer{info.port_id,
+                 tb.tx_queues.front(),
+                 tb.rx_queues.front(),
+                 info.max_desv_txq,
+                 2ull * config.burst_size,
+                 tb.send_pool,
+                 pg};
 
   uint16_t tx_free = config.burst_size, tx_nb;
   uint16_t queued = 0;
@@ -85,17 +95,18 @@ void recv_rudp(void *port) {
   uint64_t end = config.rtime * rte_get_timer_hz() + cycles;
   for (; cycles < end; cycles = rte_get_timer_cycles()) {
     auto nb_rx = rudp_peer.submit_rx_burst(pkts);
-    for(auto* pkt: std::span(start_it, start_it + nb_rx)){
-        pg.packet_pong_ctor(pkt);
-        rpkts[queued++] = pkt;
+    for (auto *pkt : std::span(start_it, start_it + nb_rx)) {
+      pg.packet_pong_ctor(pkt);
+      rpkts[queued++] = pkt;
     }
 
     tx_nb = 0;
-    if(queued)
-        tx_nb = rudp_peer.submit_tx_burst(std::span(rpkts.begin(), rpkts.begin() + queued));
+    if (queued)
+      tx_nb = rudp_peer.submit_tx_burst(
+          std::span(rpkts.begin(), rpkts.begin() + queued));
     rudp_peer.make_progress();
-    for(uint16_t i = tx_nb, j = 0; i < nb_rx; ++i)
-        rpkts[j++] = rpkts[i];
+    for (uint16_t i = tx_nb, j = 0; i < nb_rx; ++i)
+      rpkts[j++] = rpkts[i];
     tb.per_thread_submit_stat.submitted += tx_nb;
     queued -= tx_nb;
   }

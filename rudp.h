@@ -16,8 +16,6 @@
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
 
-#include <format>
-#include <iostream>
 #include <rte_mbuf_core.h>
 #include <rte_mempool.h>
 #include <rte_ring.h>
@@ -197,14 +195,14 @@ public:
 
   reference operator[](std::size_t idx) { return wd[index(idx)]; }
 
-  bool set_and_advance(std::size_t seq) {
-    assert(inside(seq));
-    auto i = index(seq);
-    if (wd[i])
-      return false;
-    wd[i] = true;
-    advance();
-    return true;
+  bool add_and_set(uint64_t seq, uint64_t rto) {
+    if (add(seq, rto)) {
+      auto i = index(seq);
+      bool retval = wd[i];
+      wd[i] = true;
+      return retval;
+    }
+    return false;
   }
 
   bool add(uint64_t seq, [[maybe_unused]] uint64_t rto) {
@@ -216,7 +214,7 @@ public:
 #else
       return false;
 #endif
-    return true;
+    return seq <= mask;
   }
 
   bool acked(uint64_t seq) {
@@ -250,7 +248,8 @@ private:
   }
 
   void resize(uint64_t rto) {
-    if (last_resize + 2 * rto > rte_get_timer_cycles())
+    uint64_t now = rte_get_timer_cycles();
+    if (last_resize + 2 * rto > now)
       return;
     auto osize = wd.size();
     auto nsize = osize * 2;
@@ -262,6 +261,7 @@ private:
       std::copy(begin, begin + ub + 1, nbegin + osize);
     mask = nsize - 1;
     wd = std::move(nwd);
+    last_resize = rte_get_timer_cycles();
   }
 
   std::vector<bool> wd;
@@ -273,6 +273,10 @@ private:
 
 class retransmission_handler {
 public:
+  struct statistics {
+    uint64_t acked, retransmitted, rtt;
+    statistics() : acked(0), retransmitted(0) {}
+  };
   retransmission_handler(std::size_t window_size)
       : ackstore(window_size, min_seq), seq(min_seq), rtt(rte_get_timer_hz()),
         rtt_dv(rte_get_timer_hz()), timeout(rtt + 4 * rtt_dv) {}
@@ -284,15 +288,12 @@ public:
       if (!desc.retransmitted) {
         std::tie(rtt, rtt_dv) = estimate_timeout(rtt, rtt_dv, now - desc.ts);
         timeout = 2 * (rtt + 4 * rtt_dv); // always include one backoff
+        stats.rtt = rtt;
       }
       assert(desc.packet);
       rte_pktmbuf_free(desc.packet);
       unacked_packets.pop_front();
     }
-  }
-
-  void cleanup_window() {
-    ackstore.advance([&](uint64_t seq) { cleanup_acked_pkts(seq); });
   }
 
   std::size_t insert_burst(std::span<pkt_t *> pkts, tx_pkt_buffer &tx_buffer,
@@ -315,10 +316,11 @@ public:
 
   void probe_retransmit(tx_pkt_buffer &tx_buffer, std::size_t n) {
     auto i = 0u;
-    for (; i < n; ++i) {
+    for (; i < n && !unacked_packets.empty(); ++i) {
       auto &desc = unacked_packets.front();
       if (ackstore.acked(desc.seq) || !desc.requires_retry())
         break;
+      ++stats.retransmitted;
       desc.update_ts(timeout);
       desc.retransmitted = true;
       tx_buffer.push_back(desc.packet);
@@ -329,15 +331,19 @@ public:
   }
 
   void acknowledge(uint64_t seq) {
-    if (!ackstore.inside(seq))
+    if (!ackstore.inside(seq) || ackstore[seq])
       return;
+    ++stats.acked;
     ackstore[seq] = true;
-    cleanup_window();
+    ackstore.advance([&](uint64_t seq) { cleanup_acked_pkts(seq); });
   }
+
+  const statistics &get_stats() const { return stats; }
 
   bool is_acked(uint64_t seq) { return ackstore.acked(seq); }
 
 private:
+  statistics stats;
   std::deque<sender_entry> unacked_packets;
   window ackstore;
   uint64_t seq;
@@ -347,9 +353,13 @@ private:
 };
 
 struct statistics {
-  uint64_t acks;
-  uint64_t piggybacked;
-  statistics() : acks(0), piggybacked(0) {}
+  uint64_t retransmitted, acked, sent;
+  double rtt;
+  statistics(uint64_t retransmitted, uint64_t acked, uint64_t sent,
+             uint64_t rtt_est)
+      : retransmitted(retransmitted), acked(acked), sent(sent) {
+    rtt = static_cast<double>(rtt_est) / (rte_get_timer_hz() / 1e6);
+  }
 };
 
 struct tx_context : public port_context {
@@ -370,10 +380,16 @@ struct rx_context : public port_context {
   rx_context(uint16_t port_id, uint16_t qid, int64_t entries,
              packet_generator &pg)
       : port_context(port_id, qid), pg(pg), recv_wd(entries, min_seq) {}
+
   bool process_seq(uint64_t seq) {
-    if (recv_wd.acked(seq) || recv_wd.beyond_window(seq))
+    if (recv_wd.acked(seq))
       return false;
-    return recv_wd.set_and_advance(seq);
+    if (!recv_wd.add_and_set(seq, 0)) {
+      recv_wd.advance();
+      return true;
+    } else {
+      return false;
+    }
   }
 };
 
@@ -387,24 +403,17 @@ struct peer {
   tx_context tx_ctx;
   rx_context rx_ctx;
   ack_context ack_ctx;
-  statistics stats;
+  struct {
+    uint64_t sent = 0;
+  } stats;
 
   peer(uint16_t port_id, uint16_t txq, uint16_t rxq, uint64_t entries,
        std::size_t tx_buffer_size, std::shared_ptr<rte_mempool> pool,
        packet_generator &pg)
       : tx_ctx(port_id, txq, entries, tx_buffer_size),
-        rx_ctx(port_id, rxq, entries, pg), ack_ctx(pool), stats() {}
-
-  const statistics &get_stats() const { return stats; }
+        rx_ctx(port_id, rxq, entries, pg), ack_ctx(pool) {}
 
   uint16_t submit_tx_burst(std::span<pkt_t *> pkts) {
-#ifndef NDEBUG
-    rte_eth_stats dev_stats;
-    rte_eth_stats_get(tx_ctx.port_id, &dev_stats);
-    std::cerr << std::format("errors: {}, packets: {}, bytes: {} \n",
-                             dev_stats.oerrors, dev_stats.opackets,
-                             dev_stats.obytes);
-#endif
     auto ctor = [&](pkt_t *pkt, uint64_t seq) {
       auto *hdr = rte_pktmbuf_mtod_offset(pkt, rudp_header *, HDR_SIZE);
       hdr->op = MessageType::NORMAL_PKT;
@@ -412,7 +421,6 @@ struct peer {
       if (!ack_ctx.acks.empty()) {
         hdr->ack = ack_ctx.acks.back();
         ack_ctx.acks.pop_back();
-        stats.piggybacked++;
       } else {
         hdr->ack = 0;
       }
@@ -422,8 +430,14 @@ struct peer {
     auto nb_tx =
         rte_eth_tx_burst(tx_ctx.port_id, tx_ctx.qid, tx_ctx.tx_buffer.data(),
                          tx_ctx.tx_buffer.head);
+    stats.sent += inserted;
     tx_ctx.tx_buffer.cleanup(nb_tx);
     return inserted;
+  }
+
+  statistics get_stats() const {
+    auto &rt_stats = tx_ctx.retry_buffer.get_stats();
+    return {rt_stats.acked, rt_stats.retransmitted, stats.sent, rt_stats.rtt};
   }
 
   void retry_last_n(std::size_t n) {
