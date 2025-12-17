@@ -41,6 +41,7 @@ static rte_mempool *setup_send_pool(opmode role, uint32_t pool_sz,
   switch (role) {
   case opmode::PING:
   case opmode::FORWARD:
+  case opmode::PONG:
     return pool_create(name, pool_sz, lcore_id, RTE_MBUF_DEFAULT_BUF_SIZE);
   default:
     return nullptr;

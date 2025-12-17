@@ -199,9 +199,11 @@ public:
   reference operator[](std::size_t idx) { return wd[index(idx)]; }
 
   bool set_and_advance(std::size_t ack_seq) {
-    if (!inside(ack_seq) || wd[index(ack_seq)])
+    assert(inside(ack_seq));  
+    auto i = index(ack_seq);  
+    if (wd[i])
       return false;
-    wd[index(ack_seq)] = true;
+    wd[i] = true;
     advance();
     return true;
   }
@@ -436,6 +438,8 @@ struct peer {
     auto free_for_acks = free_ack_buf.size();
     free_for_acks = std::min(free_for_acks, ack_ctx.acks.size());
     auto total_acks = ack_ctx.acks.size();
+    if(total_acks == 0)
+        return false;
     uint64_t processed = 0;
     uint16_t buffers_used = 0;
     for (auto &pkt : free_ack_buf.subspan(0, free_for_acks)) {
@@ -465,6 +469,8 @@ struct peer {
 
   uint16_t submit_rx_burst(std::span<pkt_t *> pkts) {
     auto process_seq = [&](rudp_header *hdr) -> bool {
+        if(!rx_ctx.recv_wd.inside(hdr->seq))
+            return false;
         return rx_ctx.recv_wd.set_and_advance(hdr->seq);
     };
     uint16_t rcvd =

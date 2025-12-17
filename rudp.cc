@@ -93,7 +93,7 @@ void recv_rudp(void *port) {
     tx_nb = 0;
     if(queued)
         tx_nb = rudp_peer.submit_tx_burst(std::span(rpkts.begin(), rpkts.begin() + queued));
-
+    rudp_peer.make_progress();
     for(uint16_t i = tx_nb, j = 0; i < nb_rx; ++i)
         rpkts[j++] = rpkts[i];
     tb.per_thread_submit_stat.submitted += tx_nb;
