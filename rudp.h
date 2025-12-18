@@ -195,29 +195,29 @@ public:
 
   reference operator[](std::size_t idx) { return wd[index(idx)]; }
 
-  bool add_and_set(uint64_t seq, uint64_t rto) {
-    if (add(seq, rto)) {
-      auto i = index(seq);
-      bool retval = wd[i];
-      wd[i] = true;
-      return retval;
-    }
-    return false;
-  }
-
-  bool add(uint64_t seq, [[maybe_unused]] uint64_t rto) {
-    assert(seq >= least_in_window);
-    seq -= least_in_window;
-    if (seq > mask)
+  bool try_reserve(uint64_t seq, [[maybe_unused]] uint64_t rto){
+      assert(seq >= least_in_window);
+      seq -= least_in_window;
+      if (seq > mask)
 #ifdef RESIZE
-      resize(rto);
+          maybe_resize(rto);
 #else
       return false;
 #endif
     return seq <= mask;
   }
 
-  bool acked(uint64_t seq) {
+  bool try_reserve_and_set(uint64_t seq, uint64_t rto = 0){
+      if(try_reserve(seq, rto)){
+          auto i = index(seq);
+          bool prv = wd[i];
+          wd[i] = true;
+          return !prv;
+      }
+      return false;
+  }
+
+  bool is_set(uint64_t seq) {
     return seq < least_in_window ||
            (seq <= least_in_window + mask && wd[index(seq)]);
   }
@@ -247,9 +247,9 @@ private:
     return (i - least_in_window + lb) & mask;
   }
 
-  void resize(uint64_t rto) {
+  void maybe_resize(uint64_t rto) {
     uint64_t now = rte_get_timer_cycles();
-    if (last_resize + 2 * rto > now)
+    if (last_resize + 4 * rto > now)
       return;
     auto osize = wd.size();
     auto nsize = osize * 2;
@@ -302,7 +302,7 @@ public:
     auto space = std::min(tx_buffer.capacity(), pkts.size());
     auto nb = 0;
     for (auto *pkt : pkts.subspan(0, space)) {
-      if (!ackstore.add(seq, timeout))
+      if (!ackstore.try_reserve(seq, timeout))
         break;
       ++nb;
       ctor(pkt, seq);
@@ -318,7 +318,7 @@ public:
     auto i = 0u;
     for (; i < n && !unacked_packets.empty(); ++i) {
       auto &desc = unacked_packets.front();
-      if (ackstore.acked(desc.seq) || !desc.requires_retry())
+      if (ackstore.is_set(desc.seq) || !desc.requires_retry())
         break;
       ++stats.retransmitted;
       desc.update_ts(timeout);
@@ -331,7 +331,7 @@ public:
   }
 
   void acknowledge(uint64_t seq) {
-    if (!ackstore.inside(seq) || ackstore[seq])
+    if (ackstore.beyond_window(seq) || ackstore.is_set(seq))
       return;
     ++stats.acked;
     ackstore[seq] = true;
@@ -340,7 +340,7 @@ public:
 
   const statistics &get_stats() const { return stats; }
 
-  bool is_acked(uint64_t seq) { return ackstore.acked(seq); }
+  bool is_acked(uint64_t seq) { return ackstore.is_set(seq); }
 
 private:
   statistics stats;
@@ -382,9 +382,9 @@ struct rx_context : public port_context {
       : port_context(port_id, qid), pg(pg), recv_wd(entries, min_seq) {}
 
   bool process_seq(uint64_t seq) {
-    if (recv_wd.acked(seq))
+    if (recv_wd.is_set(seq))
       return false;
-    if (!recv_wd.add_and_set(seq, 0)) {
+    if (recv_wd.try_reserve_and_set(seq)) {
       recv_wd.advance();
       return true;
     } else {
