@@ -512,6 +512,7 @@ struct peer {
         auto *ahdr = static_cast<rudp_ack_header *>(hdr);
         for (auto i = 0u; i < ahdr->num; ++i)
           tx_ctx.process_ack(ahdr->acks[i]);
+        rte_pktmbuf_free(pkts[i]);
         break;
       }
       }
