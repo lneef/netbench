@@ -102,11 +102,11 @@ int main(int argc, char *argv[]) {
   lcore_adapter adapter{info, config};
 
   switch (config.role) {
-  case opmode::FORWARD: {
+  case opmode::PING: {
     send_rudp(&adapter);
     break;
   }
-  case opmode::RECEIVE: {
+  case opmode::PONG: {
     recv_rudp(&adapter);
     break;
   }
