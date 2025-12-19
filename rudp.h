@@ -484,7 +484,7 @@ struct peer {
 
     auto *pkt = rte_pktmbuf_alloc(ack_pool.get());
     auto *hdr = rte_pktmbuf_mtod_offset(pkt, rudp_ack_header *, HDR_SIZE);
-    hdr->op = MessageType::DATA_PKT;
+    hdr->op = MessageType::ACK_PKT;
     hdr->ack = acked;
     rx_ctx.pg.packet_pp_ctor_udp(pkt, sizeof(rudp_header));
     rx_ctx.pg.packet_ipv4_udp_cksum(pkt);
