@@ -135,8 +135,9 @@ int benchmark_config::port_init(port_info &info) {
   uint16_t port = info.port_id;
   nb_threads = rte_lcore_count();
   struct rte_eth_dev_info dev_info;
-  struct rte_eth_rxconf rxconf;
-  struct rte_eth_txconf txconf;
+  struct rte_eth_rxconf rxconf{};
+  struct rte_eth_txconf txconf{};
+  rxconf.rx_free_thresh = burst_size;
   if (!rte_eth_dev_is_valid_port(port))
     throw std::runtime_error(std::format("Invalid port id: {}", port));
   rte_eth_conf port_conf{};
