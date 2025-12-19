@@ -188,7 +188,7 @@ struct send_window {
 
   void advance_bulk(uint64_t ack_seq, std::invocable<uint64_t> auto &&...f) {
     assert(ack_seq >= least_in_window && ack_seq < least_in_window + len);  
-    least_in_window += ack_seq;
+    least_in_window = ack_seq;
     (f(least_in_window), ...);
   }
   bool beyond_window(uint64_t seq) { return seq >= least_in_window + len; }
