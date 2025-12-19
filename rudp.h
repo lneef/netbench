@@ -123,9 +123,9 @@ struct sender_entry {
     other.packet = nullptr;
   }
 
-  void update_ts(uint64_t latency) {
-    ts = rte_get_timer_cycles();
-    deadline = ts + latency;
+  void update_ts(uint64_t now, uint64_t rto) {
+    ts = now;
+    deadline = ts + rto;
   }
 };
 
@@ -173,26 +173,33 @@ struct tx_pkt_buffer : pkt_buffer<tx_pkt_buffer> {
   tx_pkt_buffer(std::size_t size) : pkt_buffer(size) {}
 };
 
+struct send_window {
+  uint64_t least_in_window;
+  std::size_t len;
+
+  send_window(std::size_t len) : least_in_window(min_seq), len(len) {}
+
+  bool fits_in_window(uint64_t seq, [[maybe_unused]] uint64_t rto) {
+    assert(seq >= least_in_window);
+    return seq < len + least_in_window;
+  }
+
+  bool is_acked(uint64_t seq) { return seq < len + least_in_window; }
+
+  void advance_bulk(uint64_t ack_seq, std::invocable<uint64_t> auto &&...f) {
+    assert(ack_seq >= least_in_window && ack_seq < least_in_window + len);  
+    least_in_window += ack_seq;
+    (f(least_in_window), ...);
+  }
+  bool beyond_window(uint64_t seq) { return seq >= least_in_window + len; }
+};
+
 class window {
 public:
   using reference = std::vector<bool>::reference;
   window(std::size_t size, uint64_t min_seq)
       : wd(size), lb(0), ub(size - 1), mask(size - 1), least_in_window(min_seq),
         last_resize(rte_get_timer_cycles()) {}
-
-  reference operator[](std::size_t idx) { return wd[index(idx)]; }
-
-  bool try_reserve(uint64_t seq, [[maybe_unused]] uint64_t rto) {
-    assert(seq >= least_in_window);
-    seq -= least_in_window;
-    if (seq > mask)
-#ifdef RESIZE
-      maybe_resize(rto);
-#else
-      return false;
-#endif
-    return seq <= mask;
-  }
 
   uint64_t get_last_acked_packet() const { return least_in_window - 1; }
 
@@ -236,6 +243,18 @@ private:
     return (i - least_in_window + lb) & mask;
   }
 
+  bool try_reserve(uint64_t seq, [[maybe_unused]] uint64_t rto) {
+    assert(seq >= least_in_window);
+    seq -= least_in_window;
+    if (seq > mask)
+#ifdef RESIZE
+      maybe_resize(rto);
+#else
+      return false;
+#endif
+    return seq <= mask;
+  }
+
   void maybe_resize(uint64_t rto) {
     uint64_t now = rte_get_timer_cycles();
     if (last_resize + 4 * rto > now)
@@ -267,7 +286,7 @@ public:
     statistics() : acked(0), retransmitted(0) {}
   };
   retransmission_handler(std::size_t window_size)
-      : ackstore(window_size, min_seq), seq(min_seq), rtt(rte_get_timer_hz()),
+      : ackstore(window_size), seq(min_seq), rtt(rte_get_timer_hz()),
         rtt_dv(rte_get_timer_hz()), timeout(rtt + 4 * rtt_dv) {}
 
   void cleanup_acked_pkts(uint64_t seq) {
@@ -292,7 +311,7 @@ public:
     auto space = std::min(tx_buffer.capacity(), pkts.size());
     auto nb = 0;
     for (auto *pkt : pkts.subspan(0, space)) {
-      if (!ackstore.try_reserve(seq, timeout))
+      if (!ackstore.fits_in_window(seq, timeout))
         break;
       ++nb;
       ctor(pkt, seq);
@@ -308,10 +327,10 @@ public:
     auto now = rte_get_timer_cycles();
     for (; i < n && !unacked_packets.empty(); ++i) {
       auto &desc = unacked_packets.front();
-      if (ackstore.is_set(desc.seq) || !desc.requires_retry(now))
+      if (ackstore.is_acked(desc.seq) || !desc.requires_retry(now))
         break;
       ++stats.retransmitted;
-      desc.update_ts(timeout);
+      desc.update_ts(now, timeout);
       desc.retransmitted = true;
       tx_buffer.push_back(desc.packet);
       pkt_inc_refcnt(desc.packet);
@@ -321,21 +340,18 @@ public:
   }
 
   void acknowledge(uint64_t seq) {
-    if (ackstore.beyond_window(seq) || ackstore.is_set(seq))
+    if (ackstore.beyond_window(seq) || ackstore.is_acked(seq))
       return;
     ++stats.acked;
-    ackstore[seq] = true;
-    ackstore.advance([&](uint64_t seq) { cleanup_acked_pkts(seq); });
+    ackstore.advance_bulk(seq, [&](uint64_t seq) { cleanup_acked_pkts(seq); });
   }
 
   const statistics &get_stats() const { return stats; }
 
-  bool is_acked(uint64_t seq) { return ackstore.is_set(seq); }
-
 private:
   statistics stats;
   std::deque<sender_entry> unacked_packets;
-  window ackstore;
+  send_window ackstore;
   uint64_t seq;
   uint64_t rtt;
   uint64_t rtt_dv;
@@ -412,12 +428,13 @@ template <typename... O>
   requires(std::is_base_of_v<seq_observer<O>, O> && ...)
 struct ack_context {
   std::shared_ptr<rte_mempool> ack_pool;
-  std::tuple<O*...> observers;
+  std::tuple<O *...> observers;
 
   void process_seq(uint64_t seq) {
-    std::apply([seq](auto &&...elems) { (elems->process_seq(seq), ...); }, observers);
+    std::apply([seq](auto &&...elems) { (elems->process_seq(seq), ...); },
+               observers);
   }
-  ack_context(std::shared_ptr<rte_mempool> pool, O* &&...observers)
+  ack_context(std::shared_ptr<rte_mempool> pool, O *&&...observers)
       : ack_pool(std::move(pool)), observers((observers)...) {}
 };
 
