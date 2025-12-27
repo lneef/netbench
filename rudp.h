@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <generic/rte_cycles.h>
 #include <limits>
 #include <memory>
 #include <rte_byteorder.h>
@@ -72,6 +73,18 @@ struct rudp_ack_header : public rudp_header_base {
 } __rte_packed;
 #endif
 
+#if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
+struct __rte_packed_begin rudp_nack_header : public rudp_header_base {
+#else
+struct rudp_nack_header : public rudp_header_base {
+#endif
+  uint64_t ack;
+#if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
+} __rte_packed_end;
+#else
+} __rte_packed;
+#endif
+
 struct port_context {
   uint16_t port_id;
   uint16_t qid;
@@ -94,6 +107,8 @@ estimate_timeout(uint64_t rtt, uint64_t rtt_dv, uint64_t measured) {
   auto nrtt_dv = (w1 * diff + w2 * rtt_dv) >> shift;
   return {nrtt, nrtt_dv};
 }
+
+
 
 struct sender_entry {
   pkt_t *packet;
@@ -173,11 +188,30 @@ struct tx_pkt_buffer : pkt_buffer<tx_pkt_buffer> {
   tx_pkt_buffer(std::size_t size) : pkt_buffer(size) {}
 };
 
+struct free_buffer : pkt_buffer<free_buffer> {
+  free_buffer(std::size_t size) : pkt_buffer(size) {}
+
+  void cleanup_impl(std::size_t threshold) {
+    rte_pktmbuf_free_bulk(buffer.data(), threshold);
+    head -= threshold;
+  }
+
+  void push_back_impl(pkt_t *pkt) {
+    if (head == buffer.size())
+      cleanup(head);
+    buffer[head++] = pkt;
+  }
+};
+
 struct send_window {
   uint64_t least_in_window;
   std::size_t len;
+  uint64_t target_tp;
+  uint64_t last_increase;
 
-  send_window(std::size_t len) : least_in_window(min_seq), len(len) {}
+  send_window(std::size_t len, uint64_t target_tp)
+      : least_in_window(min_seq), len(len), target_tp(target_tp),
+        last_increase(rte_get_timer_cycles()) {}
 
   bool fits_in_window(uint64_t seq, [[maybe_unused]] uint64_t rto) {
     assert(seq >= least_in_window);
@@ -187,9 +221,81 @@ struct send_window {
   bool is_acked(uint64_t seq) { return seq < least_in_window; }
 
   void advance_bulk(uint64_t ack_seq, std::invocable<uint64_t> auto &&...f) {
-    assert(ack_seq >= least_in_window && ack_seq < least_in_window + len);  
+    assert(ack_seq >= least_in_window && ack_seq < least_in_window + len);
     least_in_window = ack_seq;
     (f(least_in_window), ...);
+  }
+  bool beyond_window(uint64_t seq) { return seq >= least_in_window + len; }
+
+  bool try_adjust(uint64_t tsc, uint64_t rtt, uint64_t rto) {
+    if (tsc < last_increase + 2 * rto)
+      return false;
+    auto next_wd_len = static_cast<std::size_t>(
+        target_tp * static_cast<double>(rtt) / rte_get_timer_hz());
+    last_increase = tsc;
+    len = next_wd_len;
+    return true;
+  }
+};
+
+template <typename D> struct ack_observer {
+  void process_ack(uint64_t ack_seq, uint64_t now) {
+    static_cast<D *>(this)->process_ack_impl(ack_seq, now);
+  }
+};
+
+struct cnwd {
+  uint64_t least_in_window, retransmit_cnt, last_decrease;
+  std::size_t len;
+  double target_delay, cwnd_size;
+  const double ai, beta, max_md;
+  const uint64_t min_wd_size, reset_threshold;
+
+  cnwd(std::size_t initial_len, uint64_t target_delay, double ai, double beta,
+       double max_md, uint64_t reset_threshold = 256)
+      : least_in_window(min_seq), retransmit_cnt(0), last_decrease(0),
+        len(initial_len), target_delay(target_delay), cwnd_size(initial_len),
+        ai(ai), beta(beta), max_md(max_md),
+        min_wd_size(std::max<uint64_t>(initial_len >> 8, 1)),
+        reset_threshold(reset_threshold) {}
+
+  void on_ack(uint64_t ack, uint64_t now, uint64_t rtt) {
+    retransmit_cnt = 0;
+    bool can_decrease = now - last_decrease > rtt;
+    if (rtt < target_delay) {
+      cwnd_size += ai / cwnd_size * (ack - least_in_window);
+    } else if (can_decrease) {
+      cwnd_size *= 1 - beta * (rtt - target_delay) / rtt;
+      last_decrease = now;
+    }
+    least_in_window = ack;
+    len = std::max<std::size_t>(static_cast<std::size_t>(cwnd_size), 1);
+  }
+
+  void on_retransmission(std::size_t nb, uint64_t rtt, uint64_t now) {
+    if (nb == 0)
+      return;
+    bool can_decrease = now - last_decrease > rtt;
+    retransmit_cnt += nb;
+    if (retransmit_cnt > reset_threshold) {
+      cwnd_size = min_wd_size;
+    } else if (can_decrease) {
+      cwnd_size *= (1 - max_md);
+      last_decrease = now;
+    }
+    len = std::max<std::size_t>(static_cast<std::size_t>(cwnd_size), 1);
+  }
+
+  bool fits_in_window(uint64_t seq, [[maybe_unused]] uint64_t rto) {
+    assert(seq >= least_in_window);
+    return seq < len + least_in_window;
+  }
+
+  bool is_acked(uint64_t seq) { return seq < least_in_window; }
+
+  void advance_bulk(uint64_t ack_seq) {
+    assert(ack_seq >= least_in_window && ack_seq < least_in_window + len);
+    least_in_window = ack_seq;
   }
   bool beyond_window(uint64_t seq) { return seq >= least_in_window + len; }
 };
@@ -223,7 +329,8 @@ public:
   void advance(std::invocable<uint64_t> auto &&...f) {
     assert(mask + 1 == wd.size());
     assert(lb == ((least_in_window - 1) & mask));
-    while (wd[lb]) {
+    auto i = index(least_in_window);
+    while (wd[i]) {
       lb = (lb + 1) & mask;
       ub = (ub + 1) & mask;
       wd[ub] = false;
@@ -286,15 +393,20 @@ public:
     statistics() : acked(0), retransmitted(0) {}
   };
   retransmission_handler(std::size_t window_size)
-      : ackstore(window_size), seq(min_seq), rtt(rte_get_timer_hz()),
-        rtt_dv(rte_get_timer_hz()), timeout(rtt + 4 * rtt_dv) {}
+      : ackstore(window_size, rte_get_timer_hz() / 1e4, 64, 0.9, 0.5),
+        seq(min_seq), rtt(rte_get_timer_hz() / 1e4),
+        rtt_dv(rte_get_timer_hz() / 1e4), timeout(rtt + 4 * rtt_dv) {}
 
-  void cleanup_acked_pkts(uint64_t seq) {
-    auto now = rte_get_timer_cycles();
+  uint64_t cleanup_acked_pkts(uint64_t seq, uint64_t now) {
+    uint64_t burst_rtt = 0;
     while (!unacked_packets.empty() && unacked_packets.front().seq < seq) {
       auto &desc = unacked_packets.front();
       if (!desc.retransmitted) {
         std::tie(rtt, rtt_dv) = estimate_timeout(rtt, rtt_dv, now - desc.ts);
+        if (burst_rtt == 0)
+          burst_rtt = now - desc.ts;
+        else
+          burst_rtt = (burst_rtt * 7 + now - desc.ts) / 8;
         timeout = 2 * (rtt + 4 * rtt_dv); // always include one backoff
         stats.rtt = rtt;
       }
@@ -302,6 +414,7 @@ public:
       rte_pktmbuf_free(desc.packet);
       unacked_packets.pop_front();
     }
+    return burst_rtt;
   }
 
   std::size_t insert_burst(std::span<pkt_t *> pkts, tx_pkt_buffer &tx_buffer,
@@ -337,13 +450,16 @@ public:
       unacked_packets.push_back(std::move(desc));
       unacked_packets.pop_front();
     }
+    ackstore.on_retransmission(i, rtt, rte_get_timer_cycles());
   }
 
   void acknowledge(uint64_t seq) {
     if (ackstore.beyond_window(seq) || ackstore.is_acked(seq))
       return;
-    ++stats.acked;
-    ackstore.advance_bulk(seq, [&](uint64_t seq) { cleanup_acked_pkts(seq); });
+    stats.acked = seq;
+    auto now = rte_get_timer_cycles();
+    auto brtt = cleanup_acked_pkts(seq, now);
+    ackstore.on_ack(seq, now, brtt);
   }
 
   const statistics &get_stats() const { return stats; }
@@ -351,7 +467,7 @@ public:
 private:
   statistics stats;
   std::deque<sender_entry> unacked_packets;
-  send_window ackstore;
+  cnwd ackstore;
   uint64_t seq;
   uint64_t rtt;
   uint64_t rtt_dv;
