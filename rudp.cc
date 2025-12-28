@@ -39,7 +39,7 @@ void send_rudp(void *port) {
                  tb.tx_queues.front(),
                  tb.rx_queues.front(),
                  info.max_desv_txq,
-                 2ull * config.burst_size,
+                 config.burst_size,
                  tb.send_pool,
                  pg};
 
@@ -76,7 +76,7 @@ void recv_rudp(void *port) {
                  tb.tx_queues.front(),
                  tb.rx_queues.front(),
                  info.max_desv_txq,
-                 2ull * config.burst_size,
+                 config.burst_size,
                  tb.send_pool,
                  pg};
 

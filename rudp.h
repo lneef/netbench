@@ -5,6 +5,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <generic/rte_cycles.h>
@@ -203,6 +204,18 @@ struct free_buffer : pkt_buffer<free_buffer> {
   }
 };
 
+struct packet_scheduler{
+    uint64_t rate, interval, last_burst;
+    packet_scheduler(uint64_t initial_rate): rate(initial_rate), interval(), last_burst(){}
+
+    uint16_t schedule_burst(std::span<pkt_t*> pkts, uint64_t now = rte_get_timer_cycles()){
+        if(last_burst + interval * pkts.size() < now)
+            return 0;
+        return 0;
+    }
+
+};
+
 struct send_window {
   uint64_t least_in_window;
   std::size_t len;
@@ -246,17 +259,17 @@ template <typename D> struct ack_observer {
 
 struct cnwd {
   uint64_t least_in_window, retransmit_cnt, last_decrease;
-  std::size_t len;
+  std::size_t len, len_at_last_decrease;
   double target_delay, cwnd_size;
   const double ai, beta, max_md;
   const uint64_t min_wd_size, reset_threshold;
 
   cnwd(std::size_t initial_len, uint64_t target_delay, double ai, double beta,
-       double max_md, uint64_t reset_threshold = 256)
+       double max_md, uint64_t min_wd_size, uint64_t reset_threshold = 256)
       : least_in_window(min_seq), retransmit_cnt(0), last_decrease(0),
-        len(initial_len), target_delay(target_delay), cwnd_size(initial_len),
+        len(initial_len), len_at_last_decrease(initial_len), target_delay(target_delay), cwnd_size(initial_len),
         ai(ai), beta(beta), max_md(max_md),
-        min_wd_size(std::max<uint64_t>(initial_len >> 8, 1)),
+        min_wd_size(min_wd_size),
         reset_threshold(reset_threshold) {}
 
   void on_ack(uint64_t ack, uint64_t now, uint64_t rtt) {
@@ -264,6 +277,7 @@ struct cnwd {
     bool can_decrease = now - last_decrease > rtt;
     if (rtt < target_delay) {
       cwnd_size += ai / cwnd_size * (ack - least_in_window);
+      len_at_last_decrease = cwnd_size;
     } else if (can_decrease) {
       cwnd_size *= 1 - beta * (rtt - target_delay) / rtt;
       last_decrease = now;
@@ -297,7 +311,7 @@ struct cnwd {
     assert(ack_seq >= least_in_window && ack_seq < least_in_window + len);
     least_in_window = ack_seq;
   }
-  bool beyond_window(uint64_t seq) { return seq >= least_in_window + len; }
+  bool beyond_window(uint64_t seq) { return seq >= least_in_window + len_at_last_decrease; }
 };
 
 class window {
@@ -392,8 +406,8 @@ public:
     uint64_t acked, retransmitted, rtt;
     statistics() : acked(0), retransmitted(0) {}
   };
-  retransmission_handler(std::size_t window_size)
-      : ackstore(window_size, rte_get_timer_hz() / 1e4, 64, 0.9, 0.5),
+  retransmission_handler(std::size_t window_size, std::size_t burst_size)
+      : ackstore(window_size, rte_get_timer_hz() / 1e4, 64, 0.9, 0.5, burst_size),
         seq(min_seq), rtt(rte_get_timer_hz() / 1e4),
         rtt_dv(rte_get_timer_hz() / 1e4), timeout(rtt + 4 * rtt_dv) {}
 
@@ -490,7 +504,7 @@ struct tx_context : public port_context {
 
   tx_context(uint16_t port_id, uint16_t qid, std::size_t retry_size,
              std::size_t tx_size)
-      : port_context(port_id, qid), retry_buffer(retry_size),
+      : port_context(port_id, qid), retry_buffer(retry_size, tx_size),
         tx_buffer(tx_size) {}
 
   void process_ack(uint64_t ack) { retry_buffer.acknowledge(ack); }
@@ -509,7 +523,7 @@ struct ack_scheduler : public seq_observer<ack_scheduler> {
   void process_seq_impl(uint64_t seq) { pending_from_retry = seq < last_acked; }
 
   bool ack_pending(uint64_t seq) {
-    return pending_from_retry || seq - last_acked > threshold;
+    return pending_from_retry || seq > last_acked;
   }
 
   void ack_callback(uint64_t seq) {
@@ -568,7 +582,7 @@ struct peer {
        packet_generator &pg)
       : tx_ctx(port_id, txq, entries, tx_buffer_size),
         rx_ctx(port_id, rxq, entries, pg),
-        scheduler(std::make_unique<ack_scheduler>(entries)),
+        scheduler(std::make_unique<ack_scheduler>(tx_buffer_size)),
         ack_ctx(pool, scheduler.get()) {}
 
   uint16_t submit_tx_burst(std::span<pkt_t *> pkts) {
