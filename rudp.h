@@ -9,7 +9,6 @@
 #include <cstring>
 #include <deque>
 #include <generic/rte_cycles.h>
-#include <limits>
 #include <memory>
 #include <rte_byteorder.h>
 #include <rte_cycles.h>
@@ -31,6 +30,8 @@
 #include "packet.h"
 
 static constexpr uint64_t min_seq = 1;
+
+static int timestamp_offset = -1;
 
 enum class MessageType : uint16_t {
   DATA_PKT = 0,
@@ -109,23 +110,21 @@ estimate_timeout(uint64_t rtt, uint64_t rtt_dv, uint64_t measured) {
   return {nrtt, nrtt_dv};
 }
 
-
+static __inline uint64_t get_ts(pkt_t *mbuf){
+    return RTE_MBUF_DYNFIELD(mbuf, timestamp_offset, uint64_t);
+}
 
 struct sender_entry {
   pkt_t *packet;
   uint64_t seq;
-  uint64_t ts;
-  uint64_t deadline;
   bool retransmitted;
   sender_entry()
-      : packet(nullptr), seq(0), ts(0),
-        deadline(std::numeric_limits<uint64_t>::max()), retransmitted(false) {}
-  sender_entry(pkt_t *packet, uint64_t seq, uint64_t ts, uint64_t deadline,
-               bool retransmitted)
-      : packet(packet), seq(seq), ts(ts), deadline(deadline),
+      : packet(nullptr), seq(0), retransmitted(false) {}
+  sender_entry(pkt_t *packet, uint64_t seq, bool retransmitted)
+      : packet(packet), seq(seq), 
         retransmitted(retransmitted) {}
 
-  bool requires_retry(uint64_t now) { return now > deadline; }
+  bool requires_retry(uint64_t now, uint64_t rto) { return now > get_ts(packet) + rto; }
   bool is_free() { return packet == nullptr; }
   pkt_t *get() { return packet; }
 
@@ -133,15 +132,9 @@ struct sender_entry {
   sender_entry(sender_entry &&other) {
     packet = other.packet;
     seq = other.seq;
-    ts = other.ts;
-    deadline = other.deadline;
+
     retransmitted = other.retransmitted;
     other.packet = nullptr;
-  }
-
-  void update_ts(uint64_t now, uint64_t rto) {
-    ts = now;
-    deadline = ts + rto;
   }
 };
 
@@ -204,50 +197,16 @@ struct free_buffer : pkt_buffer<free_buffer> {
   }
 };
 
-struct packet_scheduler{
-    uint64_t rate, interval, last_burst;
-    packet_scheduler(uint64_t initial_rate): rate(initial_rate), interval(), last_burst(){}
+struct packet_scheduler {
+  uint64_t rate, interval, last_burst;
+  packet_scheduler(uint64_t initial_rate)
+      : rate(initial_rate), interval(), last_burst() {}
 
-    uint16_t schedule_burst(std::span<pkt_t*> pkts, uint64_t now = rte_get_timer_cycles()){
-        if(last_burst + interval * pkts.size() < now)
-            return 0;
-        return 0;
-    }
-
-};
-
-struct send_window {
-  uint64_t least_in_window;
-  std::size_t len;
-  uint64_t target_tp;
-  uint64_t last_increase;
-
-  send_window(std::size_t len, uint64_t target_tp)
-      : least_in_window(min_seq), len(len), target_tp(target_tp),
-        last_increase(rte_get_timer_cycles()) {}
-
-  bool fits_in_window(uint64_t seq, [[maybe_unused]] uint64_t rto) {
-    assert(seq >= least_in_window);
-    return seq < len + least_in_window;
-  }
-
-  bool is_acked(uint64_t seq) { return seq < least_in_window; }
-
-  void advance_bulk(uint64_t ack_seq, std::invocable<uint64_t> auto &&...f) {
-    assert(ack_seq >= least_in_window && ack_seq < least_in_window + len);
-    least_in_window = ack_seq;
-    (f(least_in_window), ...);
-  }
-  bool beyond_window(uint64_t seq) { return seq >= least_in_window + len; }
-
-  bool try_adjust(uint64_t tsc, uint64_t rtt, uint64_t rto) {
-    if (tsc < last_increase + 2 * rto)
-      return false;
-    auto next_wd_len = static_cast<std::size_t>(
-        target_tp * static_cast<double>(rtt) / rte_get_timer_hz());
-    last_increase = tsc;
-    len = next_wd_len;
-    return true;
+  uint16_t schedule_burst(std::span<pkt_t *> pkts,
+                          uint64_t now = rte_get_timer_cycles()) {
+    if (last_burst + interval * pkts.size() < now)
+      return 0;
+    return 0;
   }
 };
 
@@ -267,9 +226,9 @@ struct cnwd {
   cnwd(std::size_t initial_len, uint64_t target_delay, double ai, double beta,
        double max_md, uint64_t min_wd_size, uint64_t reset_threshold = 256)
       : least_in_window(min_seq), retransmit_cnt(0), last_decrease(0),
-        len(initial_len), len_at_last_decrease(initial_len), target_delay(target_delay), cwnd_size(initial_len),
-        ai(ai), beta(beta), max_md(max_md),
-        min_wd_size(min_wd_size),
+        len(initial_len), len_at_last_decrease(initial_len),
+        target_delay(target_delay), cwnd_size(initial_len), ai(ai), beta(beta),
+        max_md(max_md), min_wd_size(min_wd_size),
         reset_threshold(reset_threshold) {}
 
   void on_ack(uint64_t ack, uint64_t now, uint64_t rtt) {
@@ -311,7 +270,9 @@ struct cnwd {
     assert(ack_seq >= least_in_window && ack_seq < least_in_window + len);
     least_in_window = ack_seq;
   }
-  bool beyond_window(uint64_t seq) { return seq >= least_in_window + len_at_last_decrease; }
+  bool beyond_window(uint64_t seq) {
+    return seq >= least_in_window + len_at_last_decrease;
+  }
 };
 
 class window {
@@ -407,21 +368,23 @@ public:
     statistics() : acked(0), retransmitted(0) {}
   };
   retransmission_handler(std::size_t window_size, std::size_t burst_size)
-      : ackstore(window_size, rte_get_timer_hz() / 1e4, 64, 0.9, 0.5, burst_size),
+      : ackstore(window_size, rte_get_timer_hz() / 1e4, 64, 0.9, 0.5,
+                 burst_size),
         seq(min_seq), rtt(rte_get_timer_hz() / 1e4),
-        rtt_dv(rte_get_timer_hz() / 1e4), timeout(rtt + 4 * rtt_dv) {}
+        rtt_dv(rte_get_timer_hz() / 1e4), rto(rtt + 4 * rtt_dv) {}
 
   uint64_t cleanup_acked_pkts(uint64_t seq, uint64_t now) {
     uint64_t burst_rtt = 0;
     while (!unacked_packets.empty() && unacked_packets.front().seq < seq) {
       auto &desc = unacked_packets.front();
       if (!desc.retransmitted) {
-        std::tie(rtt, rtt_dv) = estimate_timeout(rtt, rtt_dv, now - desc.ts);
+        auto tsc_d = now - get_ts(desc.packet);
+        std::tie(rtt, rtt_dv) = estimate_timeout(rtt, rtt_dv, now - tsc_d);
         if (burst_rtt == 0)
-          burst_rtt = now - desc.ts;
+          burst_rtt = tsc_d;
         else
-          burst_rtt = (burst_rtt * 7 + now - desc.ts) / 8;
-        timeout = 2 * (rtt + 4 * rtt_dv); // always include one backoff
+          burst_rtt = (burst_rtt * 7 + tsc_d) / 8;
+        rto = 8 * (rtt + 4 * rtt_dv); // always include one backoff
         stats.rtt = rtt;
       }
       assert(desc.packet);
@@ -434,17 +397,16 @@ public:
   std::size_t insert_burst(std::span<pkt_t *> pkts, tx_pkt_buffer &tx_buffer,
                            std::invocable<pkt_t *, uint64_t> auto &&ctor) {
     probe_retransmit(tx_buffer, tx_buffer.capacity());
-    auto ts = rte_get_timer_cycles();
     auto space = std::min(tx_buffer.capacity(), pkts.size());
     auto nb = 0;
     for (auto *pkt : pkts.subspan(0, space)) {
-      if (!ackstore.fits_in_window(seq, timeout))
+      if (!ackstore.fits_in_window(seq, rto))
         break;
       ++nb;
       ctor(pkt, seq);
       tx_buffer.push_back(pkt);
       pkt_inc_refcnt(pkt);
-      unacked_packets.emplace_back(pkt, seq++, ts, ts + timeout, false);
+      unacked_packets.emplace_back(pkt, seq++, false);
     }
     return nb;
   }
@@ -454,10 +416,9 @@ public:
     auto now = rte_get_timer_cycles();
     for (; i < n && !unacked_packets.empty(); ++i) {
       auto &desc = unacked_packets.front();
-      if (ackstore.is_acked(desc.seq) || !desc.requires_retry(now))
+      if (ackstore.is_acked(desc.seq) || !desc.requires_retry(now, rto))
         break;
       ++stats.retransmitted;
-      desc.update_ts(now, timeout);
       desc.retransmitted = true;
       tx_buffer.push_back(desc.packet);
       pkt_inc_refcnt(desc.packet);
@@ -485,7 +446,7 @@ private:
   uint64_t seq;
   uint64_t rtt;
   uint64_t rtt_dv;
-  uint64_t timeout;
+  uint64_t rto;
 };
 
 struct statistics {
@@ -617,6 +578,13 @@ struct peer {
     tx_ctx.retry_buffer.probe_retransmit(
         tx_ctx.tx_buffer, std::min(n, tx_ctx.tx_buffer.capacity()));
     auto tx_nb = submit_tx_burst_posted(tx_ctx.tx_buffer);
+    std::ranges::for_each(
+        tx_ctx.tx_buffer.begin(), tx_ctx.tx_buffer.begin() + tx_nb,
+        [now = rte_get_timer_cycles()](auto &mbuf) {
+          assert(timestamp_offset >= 0);
+          auto *ts = RTE_MBUF_DYNFIELD(mbuf, timestamp_offset, uint64_t *);
+          *ts = now;
+        });
     tx_ctx.tx_buffer.cleanup(tx_nb);
   }
 

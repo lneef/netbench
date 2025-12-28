@@ -23,6 +23,7 @@
 #include <rte_udp.h>
 #include <stdalign.h>
 #include <stdbool.h>
+#include <stdexcept>
 #include <stdint.h>
 
 #include "packet.h"
@@ -92,9 +93,19 @@ void recv_rudp(void *port) {
   }
 }
 
+using timestamp_t = uint64_t;
+static const struct rte_mbuf_dynfield tsc_dynfield_desc = {
+    .name = "example_bbdev_dynfield_tsc",
+    .size = sizeof(timestamp_t),
+    .align = alignof(timestamp_t),
+    .flags = 0};
+
 int main(int argc, char *argv[]) {
   int dpdk_argc = rte_eal_init(argc, argv);
   DPDK_LIFETIME_BEGIN
+  timestamp_offset = rte_mbuf_dynfield_register(&tsc_dynfield_desc);
+  if (timestamp_offset < 0)
+    throw std::runtime_error("Could not register dynfield");
   port_info info;
   benchmark_config config;
   config.port_init_cmdline(argc - dpdk_argc, argv + dpdk_argc);
