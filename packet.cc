@@ -45,7 +45,7 @@ void packet_generator::packet_ipv4_ctor(pkt_t *mbuf, struct rte_ipv4_hdr *ipv4, 
   ipv4->fragment_offset = 0;
   ipv4->type_of_service = 0;
   ipv4->hdr_checksum = 0;
-  ipv4->type_of_service = 0b10  << 6;
+  ipv4->type_of_service = 0x02;
   mbuf->l3_len = sizeof(struct rte_ipv4_hdr);
   mbuf->data_len += sizeof(struct rte_ipv4_hdr);
   mbuf->pkt_len += sizeof(struct rte_ipv4_hdr);

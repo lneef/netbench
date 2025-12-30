@@ -50,9 +50,10 @@ struct benchmark_config {
   uint16_t flows;
   uint16_t nb_threads;
   uint16_t nb_tx, nb_rx;
+  uint32_t mbuf_size;
   rte_ether_addr dmac;
   opmode role;
-  benchmark_config() : frame_size(DEFAULT_FRAME_SIZE), rtime(DEFAULT_RTIME), burst_size(DEFAULT_BURST_SIZE), flows(1), nb_threads(1), nb_tx(1), nb_rx(1) {}
+  benchmark_config() : frame_size(DEFAULT_FRAME_SIZE), rtime(DEFAULT_RTIME), burst_size(DEFAULT_BURST_SIZE), flows(1), nb_threads(1), nb_tx(1), nb_rx(1), mbuf_size(RTE_MBUF_DEFAULT_BUF_SIZE) {}
   int port_init_cmdline(int argc, char **argv);
   int port_init(port_info &info);
 };
