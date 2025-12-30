@@ -664,7 +664,7 @@ struct peer {
           rte_pktmbuf_mtod_offset(pkts[i], rudp_header_base *, HDR_SIZE);
       auto iphdr = rte_pktmbuf_mtod_offset(pkts[i], rte_ipv4_hdr*, sizeof(rte_ether_hdr));
       static constexpr uint8_t ecn_mask = 3;
-      stats.with_ecn += (iphdr->type_of_service >> 6) & ecn_mask ? 1 : 0;
+      stats.with_ecn += ((iphdr->type_of_service >> 6) & ecn_mask) == ecn_mask ? 1 : 0;
       switch (hdr->op) {
       case MessageType::DATA_PKT: {
         auto *nhdr = static_cast<rudp_header *>(hdr);
