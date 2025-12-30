@@ -14,6 +14,7 @@
 #include <rte_cycles.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
+#include <rte_ip4.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
 
@@ -110,21 +111,21 @@ estimate_timeout(uint64_t rtt, uint64_t rtt_dv, uint64_t measured) {
   return {nrtt, nrtt_dv};
 }
 
-static __inline uint64_t get_ts(pkt_t *mbuf){
-    return RTE_MBUF_DYNFIELD(mbuf, timestamp_offset, uint64_t);
+static __inline uint64_t get_ts(pkt_t *mbuf) {
+  return *RTE_MBUF_DYNFIELD(mbuf, timestamp_offset, uint64_t *);
 }
 
 struct sender_entry {
   pkt_t *packet;
   uint64_t seq;
   bool retransmitted;
-  sender_entry()
-      : packet(nullptr), seq(0), retransmitted(false) {}
+  sender_entry() : packet(nullptr), seq(0), retransmitted(false) {}
   sender_entry(pkt_t *packet, uint64_t seq, bool retransmitted)
-      : packet(packet), seq(seq), 
-        retransmitted(retransmitted) {}
+      : packet(packet), seq(seq), retransmitted(retransmitted) {}
 
-  bool requires_retry(uint64_t now, uint64_t rto) { return now > get_ts(packet) + rto; }
+  bool requires_retry(uint64_t now, uint64_t rto) {
+    return now > get_ts(packet) + rto;
+  }
   bool is_free() { return packet == nullptr; }
   pkt_t *get() { return packet; }
 
@@ -198,15 +199,40 @@ struct free_buffer : pkt_buffer<free_buffer> {
 };
 
 struct packet_scheduler {
-  uint64_t rate, interval, last_burst;
-  packet_scheduler(uint64_t initial_rate)
-      : rate(initial_rate), interval(), last_burst() {}
+  uint64_t rate, interval, next_burst, rtt;
+  double rate_update;
+  double t_low, t_high, rtt_d;
+  const double beta, alpha;
+  packet_scheduler(uint64_t initial_rate, double t_low, double t_high)
+      : rate(initial_rate), interval(), next_burst(), rtt(t_high),
+        rate_update(rte_get_timer_hz() / t_low), t_low(t_low), t_high(t_high),
+        beta(0.8), alpha(0.9) {}
 
-  uint16_t schedule_burst(std::span<pkt_t *> pkts,
-                          uint64_t now = rte_get_timer_cycles()) {
-    if (last_burst + interval * pkts.size() < now)
-      return 0;
-    return 0;
+  bool prepare_schedule_burst(uint16_t pkts,
+                              uint64_t now = rte_get_timer_cycles()) {
+    if (now > next_burst) {
+      next_burst = now + pkts * interval;
+      return true;
+    }
+    return false;
+  }
+
+  void update_rate(uint64_t new_rtt) {
+    static constexpr auto lez = [](double v1) { return v1 < 0.1; };
+    double new_rtt_diff = new_rtt - rtt;
+    rtt_d = alpha * rtt_d + (1 - alpha) * new_rtt_diff;
+    rtt = new_rtt;
+    auto grad = rtt_d / rtt;
+    if (rtt < t_low) {
+      rate += rate_update;
+    } else if (rtt > t_high) {
+      rate *= (1 - beta * (1 - t_high / rtt));
+    } else if (lez(grad)) {
+      rate += rate_update;
+    } else {
+      rate += (1 - beta * grad);
+    }
+    interval = rte_get_timer_hz() / rate;
   }
 };
 
@@ -368,10 +394,8 @@ public:
     statistics() : acked(0), retransmitted(0) {}
   };
   retransmission_handler(std::size_t window_size, std::size_t burst_size)
-      : ackstore(window_size, rte_get_timer_hz() / 1e4, 64, 0.9, 0.5,
-                 burst_size),
-        seq(min_seq), rtt(rte_get_timer_hz() / 1e4),
-        rtt_dv(rte_get_timer_hz() / 1e4), rto(rtt + 4 * rtt_dv) {}
+      :
+        seq(min_seq), rtt(), rtt_dv(), rto(rte_get_timer_hz()) {}
 
   uint64_t cleanup_acked_pkts(uint64_t seq, uint64_t now) {
     uint64_t burst_rtt = 0;
@@ -379,7 +403,10 @@ public:
       auto &desc = unacked_packets.front();
       if (!desc.retransmitted) {
         auto tsc_d = now - get_ts(desc.packet);
-        std::tie(rtt, rtt_dv) = estimate_timeout(rtt, rtt_dv, now - tsc_d);
+        if (rtt == 0)
+          rtt = tsc_d;
+        else
+          std::tie(rtt, rtt_dv) = estimate_timeout(rtt, rtt_dv, tsc_d);
         if (burst_rtt == 0)
           burst_rtt = tsc_d;
         else
@@ -400,8 +427,6 @@ public:
     auto space = std::min(tx_buffer.capacity(), pkts.size());
     auto nb = 0;
     for (auto *pkt : pkts.subspan(0, space)) {
-      if (!ackstore.fits_in_window(seq, rto))
-        break;
       ++nb;
       ctor(pkt, seq);
       tx_buffer.push_back(pkt);
@@ -416,7 +441,7 @@ public:
     auto now = rte_get_timer_cycles();
     for (; i < n && !unacked_packets.empty(); ++i) {
       auto &desc = unacked_packets.front();
-      if (ackstore.is_acked(desc.seq) || !desc.requires_retry(now, rto))
+      if (desc.seq < stats.acked || !desc.requires_retry(now, rto))
         break;
       ++stats.retransmitted;
       desc.retransmitted = true;
@@ -425,16 +450,18 @@ public:
       unacked_packets.push_back(std::move(desc));
       unacked_packets.pop_front();
     }
-    ackstore.on_retransmission(i, rtt, rte_get_timer_cycles());
+    //ackstore.on_retransmission(i, rtt, rte_get_timer_cycles());
   }
 
   void acknowledge(uint64_t seq) {
-    if (ackstore.beyond_window(seq) || ackstore.is_acked(seq))
-      return;
+    //if (ackstore.beyond_window(seq) || ackstore.is_acked(seq))
+    //  return;
+    if(seq < stats.acked)
+        return;
     stats.acked = seq;
     auto now = rte_get_timer_cycles();
-    auto brtt = cleanup_acked_pkts(seq, now);
-    ackstore.on_ack(seq, now, brtt);
+    cleanup_acked_pkts(seq, now);
+    //ackstore.on_ack(seq, now, brtt);
   }
 
   const statistics &get_stats() const { return stats; }
@@ -442,7 +469,7 @@ public:
 private:
   statistics stats;
   std::deque<sender_entry> unacked_packets;
-  cnwd ackstore;
+  //cnwd ackstore;
   uint64_t seq;
   uint64_t rtt;
   uint64_t rtt_dv;
@@ -450,11 +477,11 @@ private:
 };
 
 struct statistics {
-  uint64_t retransmitted, acked, sent;
+  uint64_t retransmitted, acked, sent, ecn;
   double rtt;
-  statistics(uint64_t retransmitted, uint64_t acked, uint64_t sent,
+  statistics(uint64_t retransmitted, uint64_t acked, uint64_t sent, uint64_t ecn,
              uint64_t rtt_est)
-      : retransmitted(retransmitted), acked(acked), sent(sent) {
+      : retransmitted(retransmitted), acked(acked), sent(sent), ecn(ecn) {
     rtt = static_cast<double>(rtt_est) / (rte_get_timer_hz() / 1e6);
   }
 };
@@ -536,6 +563,7 @@ struct peer {
   ack_context<ack_scheduler> ack_ctx;
   struct {
     uint64_t sent = 0;
+    uint64_t with_ecn = 0;
   } stats;
 
   peer(uint16_t port_id, uint16_t txq, uint16_t rxq, uint64_t entries,
@@ -565,13 +593,20 @@ struct peer {
         rte_eth_tx_burst(tx_ctx.port_id, tx_ctx.qid, tx_ctx.tx_buffer.data(),
                          tx_ctx.tx_buffer.head);
     stats.sent += inserted;
+    std::ranges::for_each(
+        tx_ctx.tx_buffer.begin(), tx_ctx.tx_buffer.begin() + nb_tx,
+        [now = rte_get_timer_cycles()](auto &mbuf) {
+          assert(timestamp_offset >= 0);
+          auto *ts = RTE_MBUF_DYNFIELD(mbuf, timestamp_offset, uint64_t *);
+          *ts = now;
+        });
     tx_ctx.tx_buffer.cleanup(nb_tx);
     return inserted;
   }
 
   statistics get_stats() const {
     auto &rt_stats = tx_ctx.retry_buffer.get_stats();
-    return {rt_stats.retransmitted, rt_stats.acked, stats.sent, rt_stats.rtt};
+    return {rt_stats.retransmitted, rt_stats.acked, stats.sent, rt_stats.rtt, stats.with_ecn};
   }
 
   void retry_last_n(std::size_t n) {
@@ -627,6 +662,9 @@ struct peer {
       }
       auto *hdr =
           rte_pktmbuf_mtod_offset(pkts[i], rudp_header_base *, HDR_SIZE);
+      auto iphdr = rte_pktmbuf_mtod_offset(pkts[i], rte_ipv4_hdr*, sizeof(rte_ether_hdr));
+      static constexpr uint8_t ecn_mask = 3;
+      stats.with_ecn += (iphdr->type_of_service >> 6) & ecn_mask ? 1 : 0;
       switch (hdr->op) {
       case MessageType::DATA_PKT: {
         auto *nhdr = static_cast<rudp_header *>(hdr);
