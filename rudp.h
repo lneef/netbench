@@ -606,7 +606,7 @@ struct peer {
 
   statistics get_stats() const {
     auto &rt_stats = tx_ctx.retry_buffer.get_stats();
-    return {rt_stats.retransmitted, rt_stats.acked, stats.sent, rt_stats.rtt, stats.with_ecn};
+    return {rt_stats.retransmitted, rt_stats.acked, stats.sent, stats.with_ecn, rt_stats.rtt};
   }
 
   void retry_last_n(std::size_t n) {

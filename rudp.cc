@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <format>
+#include <ostream>
 #include <rte_branch_prediction.h>
 #include <rte_common.h>
 #include <rte_cycles.h>
@@ -91,6 +92,10 @@ void recv_rudp(void *port) {
     rudp_peer.make_progress();
     rte_pktmbuf_free_bulk(pkts.data(), nb_rx);
   }
+
+  auto stats = rudp_peer.get_stats();
+  std::cout << std::format("ecn: {}\n", stats.ecn);
+  std::cout << std::flush;
 }
 
 using timestamp_t = uint64_t;
