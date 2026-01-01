@@ -64,9 +64,8 @@ static void add_timestamp_rtdsc(packet_generator &pg, std::span<pkt_t *> pkts) {
 }
 
 static void print_submit_stat(submit_stat &submit_statistics,
-                              benchmark_config &config) {
-  printf("Submitted PPS: %.2f\n",
-         (double)(submit_statistics.submitted) / config.rtime);
+                              [[maybe_unused]] benchmark_config &config) {
+  printf("Submitted PPS: %.2f\n",(double)(submit_statistics.submitted));
 }
 
 static void print_stats(stat &statistics, submit_stat &submit_statistics,
@@ -162,9 +161,9 @@ int main(int argc, char *argv[]) {
   case opmode::FORWARD: {
     submit_stat submit_stats{};
     if (config.nb_tx > 1)
-      lcore_send<true>(&adapter);
+      launch_lcores(lcore_send<true>, &adapter);
     else
-      lcore_send<false>(&adapter);
+      launch_lcores(lcore_send<false>, &adapter);
     info.collect_submit_statistics(submit_stats);
     print_submit_stat(submit_stats, config);
     break;
@@ -172,6 +171,7 @@ int main(int argc, char *argv[]) {
   case opmode::PING: {
     submit_stat submit_stats{};
     stat stats{};
+    launch_lcores(lcore_ping, &adapter);
     lcore_ping(&adapter);
     info.collect_statistics(stats);
     info.collect_submit_statistics(submit_stats);

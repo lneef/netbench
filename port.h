@@ -42,7 +42,8 @@ struct port_info;
 struct benchmark_config {
   static constexpr uint16_t DEFAULT_BURST_SIZE = 32;
   static constexpr uint64_t DEFAULT_RTIME = 1;
-  static constexpr uint16_t DEFAULT_FRAME_SIZE = RTE_ETHER_MIN_LEN - RTE_ETHER_CRC_LEN;
+  static constexpr uint16_t DEFAULT_FRAME_SIZE =
+      RTE_ETHER_MIN_LEN - RTE_ETHER_CRC_LEN;
   uint32_t sip, dip;
   uint32_t frame_size;
   uint64_t rtime;
@@ -53,7 +54,10 @@ struct benchmark_config {
   uint32_t mbuf_size;
   rte_ether_addr dmac;
   opmode role;
-  benchmark_config() : frame_size(DEFAULT_FRAME_SIZE), rtime(DEFAULT_RTIME), burst_size(DEFAULT_BURST_SIZE), flows(1), nb_threads(1), nb_tx(1), nb_rx(1), mbuf_size(RTE_MBUF_DEFAULT_BUF_SIZE) {}
+  benchmark_config()
+      : frame_size(DEFAULT_FRAME_SIZE), rtime(DEFAULT_RTIME),
+        burst_size(DEFAULT_BURST_SIZE), flows(1), nb_threads(1), nb_tx(1),
+        nb_rx(1), mbuf_size(RTE_MBUF_DEFAULT_BUF_SIZE) {}
   int port_init_cmdline(int argc, char **argv);
   int port_init(port_info &info);
 };
@@ -72,14 +76,12 @@ struct thread_block {
   std::shared_ptr<rte_mempool> send_pool;
   std::string r_name, s_name;
 
-  thread_block()
-      : per_thread_stat(),
-        per_thread_submit_stat() {}
+  thread_block() : per_thread_stat(), per_thread_submit_stat() {}
 
-  void setup_rxqueues(uint16_t port, uint32_t nb_rx, uint16_t nb_desc, rte_eth_rxconf &rxconf,
-                     rte_mempool *pool);
-  void setup_txqueues(uint16_t port, uint32_t nb_tx, uint16_t nb_desc, rte_eth_txconf &txconf,
-                     rte_mempool *pool);
+  void setup_rxqueues(uint16_t port, uint32_t nb_rx, uint16_t nb_desc,
+                      rte_eth_rxconf &rxconf, rte_mempool *pool);
+  void setup_txqueues(uint16_t port, uint32_t nb_tx, uint16_t nb_desc,
+                      rte_eth_txconf &txconf, rte_mempool *pool);
 };
 
 struct port_info {
@@ -88,11 +90,13 @@ struct port_info {
   capabilities caps;
   uint32_t max_desc_rxq, max_desv_txq;
   rte_ether_addr addr;
-  port_info(): port_id(0) {}
+  port_info() : port_id(0) {}
 
-  thread_block& local() { return thread_blocks[rte_lcore_index(rte_lcore_id())]; }
+  thread_block &local() {
+    return thread_blocks[rte_lcore_index(rte_lcore_id())];
+  }
   void stop_port() { rte_eth_dev_stop(port_id); }
-  void collect_statistics(stat& statistics);
+  void collect_statistics(stat &statistics);
 
-  void collect_submit_statistics(submit_stat& statistics);
+  void collect_submit_statistics(submit_stat &statistics);
 };

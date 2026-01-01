@@ -51,9 +51,7 @@ struct lcore_adapter{
 
 typedef int (*packet_ipv4)(struct port_info *, struct rte_mbuf *);
 
-int launch_lcores(int (**lcore_fn)(void *), port_info *arg,
-                         uint16_t cores);
-
+int launch_lcores(int (*lcore_fn)(void *), void *arg);
 template<typename>
 struct padded;
 
