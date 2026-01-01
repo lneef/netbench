@@ -190,6 +190,8 @@ int benchmark_config::port_init(port_info &info) {
   rxconf.offloads = port_conf.rxmode.offloads;
   uint16_t idx = 0;
   uint16_t lcore_id = 0;
+  uint16_t setup_tx = 0;
+  uint16_t setup_rx = 0;
   RTE_LCORE_FOREACH(lcore_id){
     auto& tb = info.thread_blocks[idx];  
     tb.s_name = std::format("SEND_POOL-{}", idx);
@@ -197,8 +199,10 @@ int benchmark_config::port_init(port_info &info) {
     auto [send_pool, recv_pool] =
         alloc_pools(role, static_cast<uint32_t>(nb_rx) * (nb_rxd + burst_size),
                     static_cast<uint32_t>(nb_tx) * (nb_txd + burst_size), tb.r_name, tb.s_name, lcore_id, mbuf_size);
-    tb.setup_txqueues(port, nb_tx / nb_threads, nb_txd, txconf, send_pool);
-    tb.setup_rxqueues(port, nb_rx / nb_threads, nb_rxd, rxconf, recv_pool);
+    tb.setup_txqueues(port, nb_tx , nb_txd, txconf, send_pool, setup_tx);
+    tb.setup_rxqueues(port, nb_rx , nb_rxd, rxconf, recv_pool, setup_rx);
+    setup_tx += nb_tx;
+    setup_rx += nb_rx;
   }
   retval = rte_eth_dev_start(port);
   rte_eth_macaddr_get(port, &info.addr);
@@ -210,9 +214,9 @@ int benchmark_config::port_init(port_info &info) {
 
 void thread_block::setup_rxqueues(uint16_t port, uint32_t nb_rx,
                                   uint16_t nb_desc, rte_eth_rxconf &rxconf,
-                                  rte_mempool *pool) {
+                                  rte_mempool *pool, uint16_t rxoff) {
   recv_pool = {pool, deleter};
-  for (uint16_t i = 0; i < nb_rx; ++i) {
+  for (uint16_t i = rxoff; i < rxoff + nb_rx; ++i) {
     if (rte_eth_rx_queue_setup(port, i, nb_desc, rte_eth_dev_socket_id(port),
                                &rxconf, pool))
       throw std::runtime_error("Failed to setup rxqueue\n");
@@ -222,9 +226,9 @@ void thread_block::setup_rxqueues(uint16_t port, uint32_t nb_rx,
 
 void thread_block::setup_txqueues(uint16_t port, uint32_t nb_tx,
                                   uint16_t nb_desc, rte_eth_txconf &txconf,
-                                  rte_mempool *pool) {
+                                  rte_mempool *pool, uint16_t txoff) {
   send_pool = {pool, deleter};
-  for (uint16_t i = 0; i < nb_tx; ++i) {
+  for (uint16_t i = txoff; i < txoff + nb_tx; ++i) {
     if (rte_eth_tx_queue_setup(port, i, nb_desc, rte_eth_dev_socket_id(port),
                                &txconf))
       throw std::runtime_error("Failed to setup txqueue\n");

@@ -114,6 +114,7 @@ int lcore_ping(void *port) {
 
     } while (rx_total < tx_nb && rte_get_timer_cycles() < end);
   }
+  sleep(3);
   return 0;
 }
 
