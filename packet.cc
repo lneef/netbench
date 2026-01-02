@@ -5,6 +5,7 @@
 #include <rte_common.h>
 #include <rte_ether.h>
 #include <rte_ip.h>
+#include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_mbuf_core.h>
 #include <rte_udp.h>
@@ -24,7 +25,7 @@ void packet_generator::packet_eth_ctor(pkt_t *mbuf, rte_ether_hdr* eth) {
 }
 
 void packet_generator::packet_udp_ctor(pkt_t *mbuf, rte_udp_hdr* udp, uint16_t dgram_len) {
-  udp->src_port = rte_cpu_to_be_16(flow * config.nb_threads + tid);
+  udp->src_port = rte_cpu_to_be_16(flow * rte_lcore_count() + tid);
   udp->dst_port = rte_cpu_to_be_16(flow);
   udp->dgram_len = rte_cpu_to_be_16(dgram_len);
   udp->dgram_cksum = 0;
