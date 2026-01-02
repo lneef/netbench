@@ -114,7 +114,6 @@ int lcore_ping(void *port) {
 
     } while (rx_total < tx_nb && rte_get_timer_cycles() < end);
   }
-  sleep(3);
   return 0;
 }
 
@@ -146,6 +145,7 @@ template <bool mq> int lcore_send(void *port) {
     tx_free += tx_nb;
     tb.per_thread_submit_stat.submitted += tx_nb;
   }
+  sleep(3);
   return 0;
 }
 
