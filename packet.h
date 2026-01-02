@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <rte_ether.h>
 #include <rte_ip.h>
+#include <rte_lcore.h>
 #include <rte_mbuf_core.h>
 #include <rte_udp.h>
 
@@ -18,8 +19,8 @@ using pkt_t = rte_mbuf;
 class packet_generator {
 public:
   packet_generator(capabilities &caps, port_info &info,
-                   const benchmark_config &config, uint16_t tid = 0)
-      : caps(caps), flow(0), config(config), tid(tid) {
+                   const benchmark_config &config)
+      : caps(caps), flow(0), config(config), tid(rte_lcore_index(rte_lcore_id())) {
     rte_ether_addr_copy(&info.addr, &addr);
   }
   void packet_eth_ctor(pkt_t *mbuf, rte_ether_hdr *eth);
