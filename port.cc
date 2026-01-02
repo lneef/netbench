@@ -176,7 +176,7 @@ int benchmark_config::port_init(port_info &info) {
       dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_UDP_CKSUM;
   nb_tx = is_sender(role) ? nb_tx : 0;
   nb_rx = is_receiver(role) ? nb_rx : 0;
-  retval = rte_eth_dev_configure(port, nb_rx, nb_tx, &port_conf);
+  retval = rte_eth_dev_configure(port, nb_threads * nb_rx, nb_threads * nb_tx, &port_conf);
   if (retval != 0)
     throw std::runtime_error("Could not configure device");
 
