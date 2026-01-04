@@ -8,6 +8,7 @@
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_mbuf_core.h>
+#include <rte_tcp.h>
 #include <rte_udp.h>
 #include <stdint.h>
 
@@ -15,7 +16,7 @@
 #include "port.h"
 #include "util.h"
 
-void packet_generator::packet_eth_ctor(pkt_t *mbuf, rte_ether_hdr* eth) {
+void packet_generator::packet_eth_ctor(pkt_t *mbuf, rte_ether_hdr *eth) {
   rte_ether_addr_copy(&addr, &eth->src_addr);
   rte_ether_addr_copy(&config.dmac, &eth->dst_addr);
   eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
@@ -24,7 +25,8 @@ void packet_generator::packet_eth_ctor(pkt_t *mbuf, rte_ether_hdr* eth) {
   mbuf->pkt_len += sizeof(struct rte_ether_hdr);
 }
 
-void packet_generator::packet_udp_ctor(pkt_t *mbuf, rte_udp_hdr* udp, uint16_t dgram_len) {
+void packet_generator::packet_udp_ctor(pkt_t *mbuf, rte_udp_hdr *udp,
+                                       uint16_t dgram_len) {
   udp->src_port = rte_cpu_to_be_16(flow * rte_lcore_count() + tid);
   udp->dst_port = rte_cpu_to_be_16(flow);
   udp->dgram_len = rte_cpu_to_be_16(dgram_len);
@@ -35,7 +37,8 @@ void packet_generator::packet_udp_ctor(pkt_t *mbuf, rte_udp_hdr* udp, uint16_t d
   flow = (flow + 1) % config.flows;
 }
 
-void packet_generator::packet_ipv4_ctor(pkt_t *mbuf, struct rte_ipv4_hdr *ipv4, uint16_t total_length) {
+void packet_generator::packet_ipv4_ctor(pkt_t *mbuf, struct rte_ipv4_hdr *ipv4,
+                                        uint16_t total_length) {
   ipv4->src_addr = config.sip;
   ipv4->dst_addr = config.dip;
   ipv4->version_ihl = RTE_IPV4_VHL_DEF;
@@ -53,7 +56,7 @@ void packet_generator::packet_ipv4_ctor(pkt_t *mbuf, struct rte_ipv4_hdr *ipv4, 
 }
 
 void packet_generator::packet_pp_ctor_udp(pkt_t *mbuf) {
-  packet_pp_ctor_udp(mbuf, config.frame_size - HDR_SIZE);  
+  packet_pp_ctor_udp(mbuf, config.pktsize - PKT_HDR_SIZE);
 }
 
 void packet_generator::packet_pp_ctor_udp(pkt_t *mbuf, std::size_t msg_size) {
@@ -69,7 +72,38 @@ void packet_generator::packet_pp_ctor_udp(pkt_t *mbuf, std::size_t msg_size) {
   mbuf->nb_segs = 1;
 }
 
-bool packet_generator::packet_pong_ctor(pkt_t* pkt) {
+void packet_generator::packet_pp_ctor_tcp(pkt_t *mbuf){
+    packet_pp_ctor_tcp(mbuf, config.pktsize);
+}
+
+void packet_generator::packet_pp_ctor_tcp(pkt_t *mbuf, std::size_t pktsize) {
+  auto *eth = rte_pktmbuf_mtod(mbuf, rte_ether_hdr *);
+  auto *ipv4 = reinterpret_cast<rte_ipv4_hdr *>(eth + 1);
+  auto *tcp = reinterpret_cast<rte_tcp_hdr *>(ipv4 + 1);
+  mbuf->pkt_len = 0;
+  mbuf->data_len = 0;
+  tcp->data_off = sizeof(rte_tcp_hdr) / (sizeof(uint32_t));  
+  tcp->src_port = rte_cpu_to_be_16(flow * rte_lcore_count() + tid);
+  tcp->dst_port = rte_cpu_to_be_16(flow);
+  tcp->sent_seq = 64;
+  tcp->recv_ack = 32;
+  tcp->tcp_flags = 0;
+  tcp->tcp_flags |= RTE_TCP_ACK_FLAG;
+  tcp->tcp_urp = 0;
+  flow = (flow + 1) % config.flows; 
+  mbuf->pkt_len = pktsize - sizeof(*ipv4);
+  mbuf->data_len = mbuf->pkt_len;
+  packet_ipv4_ctor(mbuf, ipv4, mbuf->pkt_len);
+  packet_eth_ctor(mbuf, eth);
+  mbuf->nb_segs = 1;
+  mbuf->tso_segsz = RTE_ETHER_MIN_LEN - sizeof(*ipv4) - sizeof(*tcp);
+  mbuf->l4_len = sizeof(*tcp);
+  mbuf->ol_flags = RTE_MBUF_F_TX_TCP_SEG | RTE_MBUF_F_TX_IPV4 |
+                   RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_TCP_CKSUM;
+  tcp->cksum = rte_ipv4_phdr_cksum(ipv4, mbuf->ol_flags);
+}
+
+bool packet_generator::packet_pong_ctor(pkt_t *pkt) {
   struct rte_ether_hdr *eth = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
   struct rte_ipv4_hdr *ipv4 = (struct rte_ipv4_hdr *)(eth + 1);
   struct rte_udp_hdr *udp = (struct rte_udp_hdr *)(ipv4 + 1);
@@ -120,22 +154,21 @@ void packet_generator::packet_ipv4_udp_cksum(pkt_t *mbuf) {
   packet_ipv4_cksum(mbuf);
 }
 
-
 bool packet_generator::packet_verify_cksum(pkt_t *mbuf) {
   struct rte_ipv4_hdr *ipv4 = rte_pktmbuf_mtod_offset(
       mbuf, struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
   struct rte_udp_hdr *udp = (struct rte_udp_hdr *)(ipv4 + 1);
-  if(likely(caps.ip_cksum_rx)){
-      if(mbuf->ol_flags & RTE_MBUF_F_RX_IP_CKSUM_BAD)
-          return false;
-  }else{
-      if(rte_ipv4_cksum(ipv4))
-          return false;
+  if (likely(caps.ip_cksum_rx)) {
+    if (mbuf->ol_flags & RTE_MBUF_F_RX_IP_CKSUM_BAD)
+      return false;
+  } else {
+    if (rte_ipv4_cksum(ipv4))
+      return false;
   }
-  if(likely(caps.l4_cksum_rx))
-      return (mbuf->ol_flags & RTE_MBUF_F_RX_L4_CKSUM_BAD) == 0;
+  if (likely(caps.l4_cksum_rx))
+    return (mbuf->ol_flags & RTE_MBUF_F_RX_L4_CKSUM_BAD) == 0;
   else
-      return rte_ipv4_udptcp_cksum_verify(ipv4, udp) == 0;
+    return rte_ipv4_udptcp_cksum_verify(ipv4, udp) == 0;
 }
 
 bool packet_generator::packet_verify_rs(pkt_t *mbuf) {
@@ -152,20 +185,28 @@ bool packet_generator::packet_verify_ipv4(pkt_t *mbuf) {
 void packet_mempool_ctor(struct rte_mempool *mp, void *opaque, void *obj,
                          unsigned int obj_idx __rte_unused) {
   struct rte_mbuf *mbuf = (struct rte_mbuf *)obj;
-  packet_generator *pg = static_cast<packet_generator*>(opaque);
+  packet_generator *pg = static_cast<packet_generator *>(opaque);
   pg->packet_pp_ctor_udp(mbuf);
-
 
   mbuf->pool = mp;
   mbuf->next = NULL;
 }
 void packet_mempool_ctor_full(struct rte_mempool *mp, void *opaque, void *obj,
-                         unsigned int obj_idx __rte_unused) {
+                              unsigned int obj_idx __rte_unused) {
   rte_mbuf *mbuf = (struct rte_mbuf *)obj;
-  packet_generator* pg = static_cast<packet_generator*>(opaque);
+  packet_generator *pg = static_cast<packet_generator *>(opaque);
   pg->packet_pp_ctor_udp(mbuf);
 
   pg->packet_ipv4_udp_cksum(mbuf);
   mbuf->pool = mp;
   mbuf->next = NULL;
 }
+
+void packet_mempool_ctor_full_tcp(rte_mempool *mp, void *opaque, void *obj, unsigned int obj_idx __rte_unused){
+    auto *pkt = static_cast<pkt_t*>(obj);
+    packet_generator *pg = static_cast<packet_generator*>(opaque);
+    pg->packet_pp_ctor_tcp(pkt);
+    pkt->pool = mp;
+    pkt->next = nullptr;
+}
+

@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <format>
+#include <rte_build_config.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
 #include <rte_lcore.h>
@@ -73,7 +74,7 @@ int benchmark_config::port_init_cmdline(int argc, char **argv) {
   static const struct option long_options[] = {
       {"dip", required_argument, 0, 0},
       {"sip", required_argument, 0, 0},
-      {"framesize", required_argument, 0, 0},
+      {"pktsize", required_argument, 0, 0},
       {"rt", required_argument, 0, 0},
       {"bs", required_argument, 0, 0},
       {"dmac", required_argument, 0, 0},
@@ -81,7 +82,7 @@ int benchmark_config::port_init_cmdline(int argc, char **argv) {
       {"flows", required_argument, 0, 0},
       {"ntx", required_argument, 0, 0},
       {"nrx", required_argument, 0, 0},
-      {"j", required_argument, 0, 0},
+      {"framesize", required_argument, 0, 0},
       {0, 0, 0, 0}};
   while ((opt = getopt_long(argc, argv, "", long_options, &option_index)) !=
          -1) {
@@ -95,7 +96,7 @@ int benchmark_config::port_init_cmdline(int argc, char **argv) {
       sip = inet_addr(optarg);
       break;
     case 2:
-      frame_size = atol(optarg) - RTE_ETHER_CRC_LEN;
+      pktsize = atol(optarg);
       break;
     case 3:
       rtime = atol(optarg);
@@ -124,11 +125,13 @@ int benchmark_config::port_init_cmdline(int argc, char **argv) {
       nb_rx = atoi(optarg);
       break;
     case 10:
-      mbuf_size = RTE_PKTMBUF_HEADROOM + atoi(optarg); 
+       pktsize = atoi(optarg) - sizeof(rte_ether_hdr) - RTE_ETHER_CRC_LEN; 
+       break;
     default:
       break;
     }
   }
+  mbuf_size = std::max<uint32_t>(pktsize + sizeof(rte_ether_hdr) + RTE_PKTMBUF_HEADROOM, mbuf_size);
   return 0;
 }
 
@@ -159,6 +162,8 @@ int benchmark_config::port_init(port_info &info) {
     port_conf.txmode.offloads |= RTE_ETH_RX_OFFLOAD_IPV4_CKSUM;
   if (dev_info.tx_offload_capa & RTE_ETH_RX_OFFLOAD_UDP_CKSUM)
     port_conf.txmode.offloads |= RTE_ETH_RX_OFFLOAD_UDP_CKSUM;
+  if(dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_TSO)
+      port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_TCP_TSO;
 
   if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_UDP_CKSUM)
     port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_UDP_CKSUM;

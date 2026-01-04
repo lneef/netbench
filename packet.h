@@ -11,8 +11,8 @@
 #include "port.h"
 
 #define TTL 64
-#define HDR_SIZE                                                               \
-  (sizeof(rte_ether_hdr) + sizeof(rte_ipv4_hdr) + sizeof(rte_udp_hdr))
+#define PKT_HDR_SIZE (sizeof(rte_ipv4_hdr) + sizeof(rte_udp_hdr))
+#define HDR_SIZE (sizeof(rte_ether_hdr) + PKT_HDR_SIZE)
 
 using pkt_t = rte_mbuf;
 
@@ -20,7 +20,8 @@ class packet_generator {
 public:
   packet_generator(capabilities &caps, port_info &info,
                    const benchmark_config &config)
-      : caps(caps), flow(0), config(config), tid(rte_lcore_index(rte_lcore_id())) {
+      : caps(caps), flow(0), config(config),
+        tid(rte_lcore_index(rte_lcore_id())) {
     rte_ether_addr_copy(&info.addr, &addr);
   }
   void packet_eth_ctor(pkt_t *mbuf, rte_ether_hdr *eth);
@@ -28,9 +29,14 @@ public:
   void packet_ipv4_ctor(pkt_t *mbuf, rte_ipv4_hdr *ipv4, uint16_t total_length);
 
   void packet_pp_ctor_udp(pkt_t *mbuf);
-    void packet_pp_ctor_udp(pkt_t *mbuf, std::size_t msg_size);
 
-  bool packet_pong_ctor(pkt_t* pkt); 
+  void packet_pp_ctor_udp(pkt_t *mbuf, std::size_t msg_size);
+
+  void packet_pp_ctor_tcp(pkt_t *mbuf, std::size_t msg_size);
+
+  void packet_pp_ctor_tcp(pkt_t *mbuf);
+
+  bool packet_pong_ctor(pkt_t *pkt);
 
   void packet_ipv4_cksum(pkt_t *mbuf);
 
@@ -55,4 +61,7 @@ void packet_mempool_ctor(rte_mempool *mp, void *opaque, void *obj,
 
 void packet_mempool_ctor_full(rte_mempool *mp, void *opaque, void *obj,
                               unsigned int obj_idx __rte_unused);
+
+void packet_mempool_ctor_full_tcp(rte_mempool *mp, void *opaque, void *obj,
+                                  unsigned int obj_idx);
 #endif
