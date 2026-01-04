@@ -13,6 +13,7 @@
 #include <string.h>
 #include <string_view>
 #include <unordered_map>
+#include <iostream>
 
 #include "port.h"
 static std::unordered_map<std::string_view, opmode> opmodes{
@@ -158,12 +159,14 @@ int benchmark_config::port_init(port_info &info) {
 
   if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
     port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
-  if (dev_info.tx_offload_capa & RTE_ETH_RX_OFFLOAD_IPV4_CKSUM)
-    port_conf.txmode.offloads |= RTE_ETH_RX_OFFLOAD_IPV4_CKSUM;
-  if (dev_info.tx_offload_capa & RTE_ETH_RX_OFFLOAD_UDP_CKSUM)
-    port_conf.txmode.offloads |= RTE_ETH_RX_OFFLOAD_UDP_CKSUM;
-  if(dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_TSO)
+  if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM)
+    port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
+  if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_UDP_CKSUM)
+    port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
+  if(dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_TSO){
+      std::cout << std::format("TSO supported\n") << std::flush;
       port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_TCP_TSO;
+  }
 
   if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_UDP_CKSUM)
     port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_UDP_CKSUM;
