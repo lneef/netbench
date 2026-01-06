@@ -62,6 +62,7 @@ void send_rudp(void *port) {
     auto rx_nb = rudp_peer.submit_rx_burst(rpkts);
     rte_pktmbuf_free_bulk(rpkts.data(), rx_nb);
   }
+  rudp_peer.close_connection();
   auto stats = rudp_peer.get_stats();
   std::cout << std::format(
                    "acked: {}, retransmitted: {}, sent: {}, rtt: {:2}\n",

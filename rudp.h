@@ -8,7 +8,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <generic/rte_cycles.h>
 #include <memory>
 #include <rte_byteorder.h>
 #include <rte_cycles.h>
@@ -34,23 +33,28 @@ static constexpr uint64_t min_seq = 1;
 
 static int timestamp_offset = -1;
 
-enum class MessageType : uint16_t {
+enum MessageType : uint16_t {
   DATA_PKT = 0,
   ACK_PKT = 1,
+  CLOSE_PKT = 2,
 };
+static constexpr uint8_t kFIN = 1; 
 
 #if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
 struct __rte_packed_begin rudp_header_base {
 #else
 struct rudp_header_base {
 #endif
-  MessageType op;
+  MessageType op : 2;
+  uint16_t flags : 14;
+  uint64_t wnd;
 #if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
 } __rte_packed_end;
 #else
 } __rte_packed;
 #endif
 
+static_assert(sizeof(rudp_header_base) == 10, "too small");
 #if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
 struct __rte_packed_begin rudp_header : public rudp_header_base {
 #else
@@ -68,18 +72,6 @@ struct rudp_header : public rudp_header_base {
 struct __rte_packed_begin rudp_ack_header : public rudp_header_base {
 #else
 struct rudp_ack_header : public rudp_header_base {
-#endif
-  uint64_t ack;
-#if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
-} __rte_packed_end;
-#else
-} __rte_packed;
-#endif
-
-#if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
-struct __rte_packed_begin rudp_nack_header : public rudp_header_base {
-#else
-struct rudp_nack_header : public rudp_header_base {
 #endif
   uint64_t ack;
 #if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
@@ -198,120 +190,22 @@ struct free_buffer : pkt_buffer<free_buffer> {
   }
 };
 
-struct packet_scheduler {
-  uint64_t rate, interval, next_burst, rtt;
-  double rate_update;
-  double t_low, t_high, rtt_d;
-  const double beta, alpha;
-  packet_scheduler(uint64_t initial_rate, double t_low, double t_high)
-      : rate(initial_rate), interval(), next_burst(), rtt(t_high),
-        rate_update(rte_get_timer_hz() / t_low), t_low(t_low), t_high(t_high),
-        beta(0.8), alpha(0.9) {}
-
-  bool prepare_schedule_burst(uint16_t pkts,
-                              uint64_t now = rte_get_timer_cycles()) {
-    if (now > next_burst) {
-      next_burst = now + pkts * interval;
-      return true;
-    }
-    return false;
-  }
-
-  void update_rate(uint64_t new_rtt) {
-    static constexpr auto lez = [](double v1) { return v1 < 0.1; };
-    double new_rtt_diff = new_rtt - rtt;
-    rtt_d = alpha * rtt_d + (1 - alpha) * new_rtt_diff;
-    rtt = new_rtt;
-    auto grad = rtt_d / rtt;
-    if (rtt < t_low) {
-      rate += rate_update;
-    } else if (rtt > t_high) {
-      rate *= (1 - beta * (1 - t_high / rtt));
-    } else if (lez(grad)) {
-      rate += rate_update;
-    } else {
-      rate += (1 - beta * grad);
-    }
-    interval = rte_get_timer_hz() / rate;
-  }
-};
-
 template <typename D> struct ack_observer {
   void process_ack(uint64_t ack_seq, uint64_t now) {
     static_cast<D *>(this)->process_ack_impl(ack_seq, now);
   }
 };
 
-struct cnwd {
-  uint64_t least_in_window, retransmit_cnt, last_decrease;
-  std::size_t len, len_at_last_decrease;
-  double target_delay, cwnd_size;
-  const double ai, beta, max_md;
-  const uint64_t min_wd_size, reset_threshold;
-
-  cnwd(std::size_t initial_len, uint64_t target_delay, double ai, double beta,
-       double max_md, uint64_t min_wd_size, uint64_t reset_threshold = 256)
-      : least_in_window(min_seq), retransmit_cnt(0), last_decrease(0),
-        len(initial_len), len_at_last_decrease(initial_len),
-        target_delay(target_delay), cwnd_size(initial_len), ai(ai), beta(beta),
-        max_md(max_md), min_wd_size(min_wd_size),
-        reset_threshold(reset_threshold) {}
-
-  void on_ack(uint64_t ack, uint64_t now, uint64_t rtt) {
-    retransmit_cnt = 0;
-    bool can_decrease = now - last_decrease > rtt;
-    if (rtt < target_delay) {
-      cwnd_size += ai / cwnd_size * (ack - least_in_window);
-      len_at_last_decrease = cwnd_size;
-    } else if (can_decrease) {
-      cwnd_size *= 1 - beta * (rtt - target_delay) / rtt;
-      last_decrease = now;
-    }
-    least_in_window = ack;
-    len = std::max<std::size_t>(static_cast<std::size_t>(cwnd_size), 1);
-  }
-
-  void on_retransmission(std::size_t nb, uint64_t rtt, uint64_t now) {
-    if (nb == 0)
-      return;
-    bool can_decrease = now - last_decrease > rtt;
-    retransmit_cnt += nb;
-    if (retransmit_cnt > reset_threshold) {
-      cwnd_size = min_wd_size;
-    } else if (can_decrease) {
-      cwnd_size *= (1 - max_md);
-      last_decrease = now;
-    }
-    len = std::max<std::size_t>(static_cast<std::size_t>(cwnd_size), 1);
-  }
-
-  bool fits_in_window(uint64_t seq, [[maybe_unused]] uint64_t rto) {
-    assert(seq >= least_in_window);
-    return seq < len + least_in_window;
-  }
-
-  bool is_acked(uint64_t seq) { return seq < least_in_window; }
-
-  void advance_bulk(uint64_t ack_seq) {
-    assert(ack_seq >= least_in_window && ack_seq < least_in_window + len);
-    least_in_window = ack_seq;
-  }
-  bool beyond_window(uint64_t seq) {
-    return seq >= least_in_window + len_at_last_decrease;
-  }
-};
-
-class window {
-public:
+struct window {
   using reference = std::vector<bool>::reference;
   window(std::size_t size, uint64_t min_seq)
-      : wd(size), lb(0), ub(size - 1), mask(size - 1), least_in_window(min_seq),
-        last_resize(rte_get_timer_cycles()) {}
+      : wd(size), lb(0), ub(size - 1), mask(size - 1),
+        least_in_window(min_seq) {}
 
   uint64_t get_last_acked_packet() const { return least_in_window - 1; }
 
-  bool try_reserve_and_set(uint64_t seq, uint64_t rto = 0) {
-    if (try_reserve(seq, rto)) {
+  bool try_reserve_and_set(uint64_t seq) {
+    if (try_reserve(seq)) {
       auto i = index(seq);
       bool prv = wd[i];
       wd[i] = true;
@@ -331,7 +225,13 @@ public:
     assert(mask + 1 == wd.size());
     assert(lb == ((least_in_window - 1) & mask));
     auto i = index(least_in_window);
+
     while (wd[i]) {
+      if ((least_in_window & mask) == 0) {
+        last_round = round;
+        round = rte_get_timer_cycles();
+        estimate_rtt();
+      }
       lb = (lb + 1) & mask;
       ub = (ub + 1) & mask;
       wd[ub] = false;
@@ -345,28 +245,18 @@ public:
     return seq >= least_in_window && seq <= least_in_window + mask;
   }
 
-private:
   std::size_t __inline index(std::size_t i) {
     assert(i >= least_in_window);
     return (i - least_in_window + lb) & mask;
   }
 
-  bool try_reserve(uint64_t seq, [[maybe_unused]] uint64_t rto) {
+  bool try_reserve(uint64_t seq) {
     assert(seq >= least_in_window);
     seq -= least_in_window;
-    if (seq > mask)
-#ifdef RESIZE
-      maybe_resize(rto);
-#else
-      return false;
-#endif
     return seq <= mask;
   }
 
-  void maybe_resize(uint64_t rto) {
-    uint64_t now = rte_get_timer_cycles();
-    if (last_resize + 4 * rto > now)
-      return;
+  void resize() {
     auto osize = wd.size();
     auto nsize = osize * 2;
     std::vector<bool> nwd(nsize);
@@ -377,14 +267,30 @@ private:
       std::copy(begin, begin + ub + 1, nbegin + osize);
     mask = nsize - 1;
     wd = std::move(nwd);
-    last_resize = rte_get_timer_cycles();
   }
+
+  void estimate_rtt() { rtt_est = std::min(rtt_est, round - last_round); }
+
+  uint64_t get_rtt() const { return rtt_est; }
+
+  bool try_resize(uint64_t srtt) {
+    if (round - last_round <= srtt) {
+      resize();
+      assert(wd.size() == mask + 1);
+      return true;
+    }
+    return false;
+  }
+
+  std::size_t last_seq() const { return least_in_window + mask + 1; }
 
   std::vector<bool> wd;
   std::size_t lb, ub;
   std::size_t mask;
   uint64_t least_in_window;
-  uint64_t last_resize;
+  uint64_t rtt_est;
+  std::size_t acked_in_round = 0;
+  uint64_t round = 0, last_round = 0;
 };
 
 class retransmission_handler {
@@ -393,9 +299,9 @@ public:
     uint64_t acked, retransmitted, rtt;
     statistics() : acked(0), retransmitted(0) {}
   };
-  retransmission_handler(std::size_t window_size, std::size_t burst_size)
-      :
-        seq(min_seq), rtt(), rtt_dv(), rto(rte_get_timer_hz()) {}
+  retransmission_handler([[maybe_unused]] std::size_t window_size,
+                         [[maybe_unused]] std::size_t burst_size)
+      : seq(min_seq), rtt(), rtt_dv(), rto(rte_get_timer_hz()) {}
 
   uint64_t cleanup_acked_pkts(uint64_t seq, uint64_t now) {
     uint64_t burst_rtt = 0;
@@ -422,11 +328,14 @@ public:
   }
 
   std::size_t insert_burst(std::span<pkt_t *> pkts, tx_pkt_buffer &tx_buffer,
+                           uint64_t budget,
                            std::invocable<pkt_t *, uint64_t> auto &&ctor) {
     probe_retransmit(tx_buffer, tx_buffer.capacity());
     auto space = std::min(tx_buffer.capacity(), pkts.size());
     auto nb = 0;
     for (auto *pkt : pkts.subspan(0, space)) {
+      if (seq >= budget)
+        break;
       ++nb;
       ctor(pkt, seq);
       tx_buffer.push_back(pkt);
@@ -441,7 +350,7 @@ public:
     auto now = rte_get_timer_cycles();
     for (; i < n && !unacked_packets.empty(); ++i) {
       auto &desc = unacked_packets.front();
-      if (desc.seq < stats.acked || !desc.requires_retry(now, rto))
+      if (!desc.requires_retry(now, rto))
         break;
       ++stats.retransmitted;
       desc.retransmitted = true;
@@ -450,27 +359,33 @@ public:
       unacked_packets.push_back(std::move(desc));
       unacked_packets.pop_front();
     }
-    //ackstore.on_retransmission(i, rtt, rte_get_timer_cycles());
+    // ackstore.on_retransmission(i, rtt, rte_get_timer_cycles());
   }
 
   void acknowledge(uint64_t seq) {
-    //if (ackstore.beyond_window(seq) || ackstore.is_acked(seq))
-    //  return;
-    if(seq < stats.acked)
-        return;
+    // if (ackstore.beyond_window(seq) || ackstore.is_acked(seq))
+    //   return;
+    if (seq < least_unacked_pkt)
+      return;
     stats.acked = seq;
+    least_unacked_pkt = seq + 1;
     auto now = rte_get_timer_cycles();
     cleanup_acked_pkts(seq, now);
-    //ackstore.on_ack(seq, now, brtt);
+    // ackstore.on_ack(seq, now, brtt);
   }
+
+  uint64_t get_seq() const { return seq; }
+  uint64_t get_srtt() const { return rtt; }
+
+  bool all_acked() const { return least_unacked_pkt == seq; }
 
   const statistics &get_stats() const { return stats; }
 
 private:
   statistics stats;
   std::deque<sender_entry> unacked_packets;
-  //cnwd ackstore;
   uint64_t seq;
+  uint64_t least_unacked_pkt = min_seq;
   uint64_t rtt;
   uint64_t rtt_dv;
   uint64_t rto;
@@ -479,8 +394,8 @@ private:
 struct statistics {
   uint64_t retransmitted, acked, sent, ecn;
   double rtt;
-  statistics(uint64_t retransmitted, uint64_t acked, uint64_t sent, uint64_t ecn,
-             uint64_t rtt_est)
+  statistics(uint64_t retransmitted, uint64_t acked, uint64_t sent,
+             uint64_t ecn, uint64_t rtt_est)
       : retransmitted(retransmitted), acked(acked), sent(sent), ecn(ecn) {
     rtt = static_cast<double>(rtt_est) / (rte_get_timer_hz() / 1e6);
   }
@@ -489,6 +404,7 @@ struct statistics {
 struct tx_context : public port_context {
   retransmission_handler retry_buffer;
   tx_pkt_buffer tx_buffer;
+  uint64_t budget = min_seq + 4;
 
   tx_context(uint16_t port_id, uint16_t qid, std::size_t retry_size,
              std::size_t tx_size)
@@ -506,7 +422,6 @@ template <typename D> struct seq_observer {
 
 struct ack_scheduler : public seq_observer<ack_scheduler> {
   uint64_t last_acked;
-  std::size_t threshold;
   bool pending_from_retry;
   void process_seq_impl(uint64_t seq) { pending_from_retry = seq < last_acked; }
 
@@ -519,16 +434,16 @@ struct ack_scheduler : public seq_observer<ack_scheduler> {
     pending_from_retry = false;
   }
 
-  ack_scheduler(std::size_t window_size)
-      : last_acked(0), threshold(window_size >> 2), pending_from_retry(false) {}
+  ack_scheduler() : last_acked(0), pending_from_retry(false) {}
 };
 
 struct rx_context : public port_context {
+  static constexpr std::size_t initial_window = 4;
   packet_generator &pg;
   window recv_wd;
-  rx_context(uint16_t port_id, uint16_t qid, int64_t entries,
+  rx_context(uint16_t port_id, uint16_t qid, [[maybe_unused]] int64_t entries,
              packet_generator &pg)
-      : port_context(port_id, qid), pg(pg), recv_wd(entries, min_seq) {}
+      : port_context(port_id, qid), pg(pg), recv_wd(initial_window, min_seq) {}
 
   bool process_seq(uint64_t seq) {
     if (recv_wd.is_set(seq))
@@ -540,13 +455,19 @@ struct rx_context : public port_context {
       return false;
     }
   }
+
+  bool maybe_resize_wnd(uint64_t srtt) {
+    if (!srtt)
+      srtt = recv_wd.get_rtt();
+    return recv_wd.try_resize(srtt);
+  }
 };
 
 template <typename... O>
   requires(std::is_base_of_v<seq_observer<O>, O> && ...)
 struct ack_context {
   std::shared_ptr<rte_mempool> ack_pool;
-  std::tuple<O *...> observers;
+  std::tuple<O*...> observers;
 
   void process_seq(uint64_t seq) {
     std::apply([seq](auto &&...elems) { (elems->process_seq(seq), ...); },
@@ -559,7 +480,7 @@ struct ack_context {
 struct peer {
   tx_context tx_ctx;
   rx_context rx_ctx;
-  std::unique_ptr<ack_scheduler> scheduler;
+  ack_scheduler scheduler;
   ack_context<ack_scheduler> ack_ctx;
   struct {
     uint64_t sent = 0;
@@ -570,9 +491,8 @@ struct peer {
        std::size_t tx_buffer_size, std::shared_ptr<rte_mempool> pool,
        packet_generator &pg)
       : tx_ctx(port_id, txq, entries, tx_buffer_size),
-        rx_ctx(port_id, rxq, entries, pg),
-        scheduler(std::make_unique<ack_scheduler>(tx_buffer_size)),
-        ack_ctx(pool, scheduler.get()) {}
+        rx_ctx(port_id, rxq, entries, pg), scheduler(),
+        ack_ctx(pool, &scheduler) {}
 
   uint16_t submit_tx_burst(std::span<pkt_t *> pkts) {
     auto ctor = [&](pkt_t *pkt, uint64_t seq) {
@@ -580,15 +500,16 @@ struct peer {
       hdr->op = MessageType::DATA_PKT;
       hdr->seq = seq;
       auto least_in_window = rx_ctx.recv_wd.get_last_acked_packet();
-      if (scheduler->ack_pending(least_in_window)) [[unlikely]] {
+      if (scheduler.ack_pending(least_in_window)) {
         hdr->ack = least_in_window;
-        scheduler->ack_callback(hdr->ack);
+        scheduler.ack_callback(hdr->ack);
       } else {
         hdr->ack = 0;
       }
+      hdr->wnd = rx_ctx.recv_wd.last_seq();
     };
-    auto inserted =
-        tx_ctx.retry_buffer.insert_burst(pkts, tx_ctx.tx_buffer, ctor);
+    auto inserted = tx_ctx.retry_buffer.insert_burst(pkts, tx_ctx.tx_buffer,
+                                                     tx_ctx.budget, ctor);
     auto nb_tx =
         rte_eth_tx_burst(tx_ctx.port_id, tx_ctx.qid, tx_ctx.tx_buffer.data(),
                          tx_ctx.tx_buffer.head);
@@ -606,7 +527,8 @@ struct peer {
 
   statistics get_stats() const {
     auto &rt_stats = tx_ctx.retry_buffer.get_stats();
-    return {rt_stats.retransmitted, rt_stats.acked, stats.sent, stats.with_ecn, rt_stats.rtt};
+    return {rt_stats.retransmitted, rt_stats.acked, stats.sent, stats.with_ecn,
+            rt_stats.rtt};
   }
 
   void retry_last_n(std::size_t n) {
@@ -628,21 +550,20 @@ struct peer {
     assert(ack_pool.get());
     auto capacity = tx_ctx.tx_buffer.capacity();
     auto acked = rx_ctx.recv_wd.get_last_acked_packet();
-
-    if (capacity < 1 || !scheduler->ack_pending(acked))
+    if (capacity < 1 || !scheduler.ack_pending(acked))
       return false;
-
     auto *pkt = rte_pktmbuf_alloc(ack_pool.get());
     auto *hdr = rte_pktmbuf_mtod_offset(pkt, rudp_ack_header *, HDR_SIZE);
     hdr->op = MessageType::ACK_PKT;
     hdr->ack = acked;
+    hdr->wnd = rx_ctx.recv_wd.last_seq();
     rx_ctx.pg.packet_pp_ctor_udp(pkt, sizeof(rudp_header));
     rx_ctx.pg.packet_ipv4_udp_cksum(pkt);
     tx_ctx.tx_buffer.push_back(pkt);
 
     auto tx_nb = submit_tx_burst_posted(tx_ctx.tx_buffer);
     tx_ctx.tx_buffer.cleanup(tx_nb);
-    scheduler->ack_callback(acked);
+    scheduler.ack_callback(acked);
     return true;
   }
 
@@ -652,6 +573,7 @@ struct peer {
   }
 
   uint16_t submit_rx_burst(std::span<pkt_t *> pkts) {
+    rx_ctx.maybe_resize_wnd(tx_ctx.retry_buffer.get_srtt());
     uint16_t rcvd =
         rte_eth_rx_burst(rx_ctx.port_id, rx_ctx.qid, pkts.data(), pkts.size());
     uint16_t i, j;
@@ -662,9 +584,7 @@ struct peer {
       }
       auto *hdr =
           rte_pktmbuf_mtod_offset(pkts[i], rudp_header_base *, HDR_SIZE);
-      auto iphdr = rte_pktmbuf_mtod_offset(pkts[i], rte_ipv4_hdr*, sizeof(rte_ether_hdr));
-      static constexpr uint8_t ecn_mask = 3;
-      stats.with_ecn += ((iphdr->type_of_service >> 6) & ecn_mask) == ecn_mask ? 1 : 0;
+      tx_ctx.budget = std::max<uint64_t>(tx_ctx.budget, hdr->wnd);
       switch (hdr->op) {
       case MessageType::DATA_PKT: {
         auto *nhdr = static_cast<rudp_header *>(hdr);
@@ -684,9 +604,28 @@ struct peer {
         rte_pktmbuf_free(pkts[i]);
         break;
       }
+      case MessageType::CLOSE_PKT:
+            break;
+
       }
     }
     return j;
+  }
+
+  void close_connection() {
+    static constexpr uint16_t bs = 32;
+    std::vector<pkt_t *> burst(bs);
+    while (!tx_ctx.retry_buffer.all_acked()) {
+      auto nb_rx = submit_rx_burst(burst);
+      make_progress();
+      if (nb_rx)
+        rte_pktmbuf_free_bulk(burst.data(), nb_rx);
+      if(tx_ctx.tx_buffer.head){
+        auto nb_tx = submit_tx_burst_posted(tx_ctx.tx_buffer);
+        tx_ctx.tx_buffer.cleanup(nb_tx);
+      }
+    }
+
   }
 };
 
