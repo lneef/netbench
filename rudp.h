@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <rte_byteorder.h>
 #include <rte_cycles.h>
@@ -200,7 +201,7 @@ struct window {
   using reference = std::vector<bool>::reference;
   window(std::size_t size, uint64_t min_seq)
       : wd(size), lb(0), ub(size - 1), mask(size - 1),
-        least_in_window(min_seq) {}
+        least_in_window(min_seq), rtt_est(0) {}
 
   uint64_t get_last_acked_packet() const { return least_in_window - 1; }
 
@@ -290,7 +291,7 @@ struct window {
   uint64_t least_in_window;
   uint64_t rtt_est;
   std::size_t acked_in_round = 0;
-  uint64_t round = 0, last_round = 0;
+  uint64_t round = std::numeric_limits<uint64_t>::max(), last_round = 0;
 };
 
 class retransmission_handler {
