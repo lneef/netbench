@@ -275,6 +275,8 @@ struct window {
   uint64_t get_rtt() const { return rtt_est; }
 
   bool try_resize(uint64_t srtt) {
+    if(!srtt) 
+        return false;
     if (round - last_round <= srtt) {
       resize();
       assert(wd.size() == mask + 1);
@@ -291,7 +293,7 @@ struct window {
   uint64_t least_in_window;
   uint64_t rtt_est;
   std::size_t acked_in_round = 0;
-  uint64_t round = std::numeric_limits<uint64_t>::max(), last_round = 0;
+  uint64_t round = 0, last_round = 0;
 };
 
 class retransmission_handler {
