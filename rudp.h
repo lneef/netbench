@@ -224,13 +224,12 @@ struct window {
 
   void advance(std::invocable<uint64_t> auto &&...f) {
     assert(mask + 1 == wd.size());
-    assert(lb == ((least_in_window - 1) & mask));
     auto i = index(least_in_window);
-
     while (wd[i]) {
       if ((least_in_window & mask) == 0) {
         last_round = round;
         round = rte_get_timer_cycles();
+        did_resize_in_round = false;
         estimate_rtt();
       }
       lb = (lb + 1) & mask;
@@ -266,6 +265,8 @@ struct window {
     std::copy(begin + lb, wd.end(), nbegin + lb);
     if (ub < lb)
       std::copy(begin, begin + ub + 1, nbegin + osize);
+    else
+        ub += osize;
     mask = nsize - 1;
     wd = std::move(nwd);
   }
@@ -275,7 +276,7 @@ struct window {
   uint64_t get_rtt() const { return rtt_est; }
 
   bool try_resize(uint64_t srtt) {
-    if(srtt == std::numeric_limits<uint64_t>::max()) 
+    if(did_resize_in_round) 
         return false;
     if (round - last_round <= srtt) {
       resize();
@@ -294,6 +295,7 @@ struct window {
   uint64_t rtt_est;
   std::size_t acked_in_round = 0;
   uint64_t round = 0, last_round = 0;
+  bool did_resize_in_round = true;
 };
 
 class retransmission_handler {
