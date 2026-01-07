@@ -281,6 +281,7 @@ struct window {
     if (round - last_round < 2 * srtt) {
       resize();
       assert(wd.size() == mask + 1);
+      did_resize_in_round = true;
       return true;
     }
     return false;
