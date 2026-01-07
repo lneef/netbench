@@ -34,12 +34,12 @@ static constexpr uint64_t min_seq = 1;
 
 static int timestamp_offset = -1;
 
-enum MessageType : uint16_t {
+enum MessageType : uint8_t {
   DATA_PKT = 0,
   ACK_PKT = 1,
   CLOSE_PKT = 2,
 };
-static constexpr uint8_t kFIN = 1; 
+static constexpr uint8_t kFIN = 1;
 
 #if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
 struct __rte_packed_begin rudp_header_base {
@@ -47,7 +47,7 @@ struct __rte_packed_begin rudp_header_base {
 struct rudp_header_base {
 #endif
   MessageType op : 2;
-  uint16_t flags : 14;
+  uint8_t flags : 6;
   uint64_t wnd;
 #if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
 } __rte_packed_end;
@@ -55,7 +55,6 @@ struct rudp_header_base {
 } __rte_packed;
 #endif
 
-static_assert(sizeof(rudp_header_base) == 10, "too small");
 #if RTE_VERSION >= RTE_VERSION_NUM(25, 0, 0, 0)
 struct __rte_packed_begin rudp_header : public rudp_header_base {
 #else
@@ -200,8 +199,8 @@ template <typename D> struct ack_observer {
 struct window {
   using reference = std::vector<bool>::reference;
   window(std::size_t size, uint64_t min_seq)
-      : wd(size), lb(0), ub(size - 1), mask(size - 1),
-        least_in_window(min_seq), rtt_est(std::numeric_limits<uint64_t>::max()) {}
+      : wd(size), lb(0), ub(size - 1), mask(size - 1), least_in_window(min_seq),
+        rtt_est(std::numeric_limits<uint64_t>::max()) {}
 
   uint64_t get_last_acked_packet() const { return least_in_window - 1; }
 
@@ -266,7 +265,7 @@ struct window {
     if (ub < lb)
       std::copy(begin, begin + ub + 1, nbegin + osize);
     else
-        ub += osize;
+      ub += osize;
     mask = nsize - 1;
     wd = std::move(nwd);
   }
@@ -276,9 +275,10 @@ struct window {
   uint64_t get_rtt() const { return rtt_est; }
 
   bool try_resize(uint64_t srtt) {
-    if(did_resize_in_round) 
-        return false;
-    if (round - last_round <= srtt) {
+    if (did_resize_in_round)
+      return false;
+    // we increase once the window is filled more more thanf in one rtt
+    if (round - last_round < 2 * srtt) {
       resize();
       assert(wd.size() == mask + 1);
       return true;
@@ -472,7 +472,7 @@ template <typename... O>
   requires(std::is_base_of_v<seq_observer<O>, O> && ...)
 struct ack_context {
   std::shared_ptr<rte_mempool> ack_pool;
-  std::tuple<O*...> observers;
+  std::tuple<O *...> observers;
 
   void process_seq(uint64_t seq) {
     std::apply([seq](auto &&...elems) { (elems->process_seq(seq), ...); },
@@ -589,7 +589,6 @@ struct peer {
       }
       auto *hdr =
           rte_pktmbuf_mtod_offset(pkts[i], rudp_header_base *, HDR_SIZE);
-      tx_ctx.budget = std::max<uint64_t>(tx_ctx.budget, hdr->wnd);
       switch (hdr->op) {
       case MessageType::DATA_PKT: {
         auto *nhdr = static_cast<rudp_header *>(hdr);
@@ -605,13 +604,13 @@ struct peer {
       }
       case MessageType::ACK_PKT: {
         auto *ahdr = static_cast<rudp_ack_header *>(hdr);
+        tx_ctx.budget = std::max<uint64_t>(tx_ctx.budget, hdr->wnd);
         tx_ctx.process_ack(ahdr->ack);
         rte_pktmbuf_free(pkts[i]);
         break;
       }
       case MessageType::CLOSE_PKT:
-            break;
-
+        break;
       }
     }
     return j;
@@ -625,12 +624,11 @@ struct peer {
       make_progress();
       if (nb_rx)
         rte_pktmbuf_free_bulk(burst.data(), nb_rx);
-      if(tx_ctx.tx_buffer.head){
+      if (tx_ctx.tx_buffer.head) {
         auto nb_tx = submit_tx_burst_posted(tx_ctx.tx_buffer);
         tx_ctx.tx_buffer.cleanup(nb_tx);
       }
     }
-
   }
 };
 
