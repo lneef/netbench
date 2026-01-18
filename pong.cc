@@ -46,11 +46,10 @@ static bool handle_packet(packet_generator &pg, pkt_t *pkt) {
 static int lcore_pong(void *port) {
   lcore_adapter *adapter = static_cast<lcore_adapter *>(port);
   auto &[pinfo, config] = *adapter;
-  auto tid = rte_lcore_id();
   std::vector<pkt_t *> pkts(config.burst_size);
   std::vector<pkt_t *> pkts_out(config.burst_size);
   uint16_t nb_rx, nb_tx = 0, nb_rm = 0;
-  auto &tb = pinfo.thread_blocks[tid];
+  auto &tb = pinfo.local();
   packet_generator pg(pinfo.caps, pinfo, config);
   for (; !terminate;) {
     nb_rx = rte_eth_rx_burst(pinfo.port_id, tb.rx_queues.front(), pkts.data(),
@@ -86,6 +85,9 @@ static int lcore_recv(void *port) {
     rcvd += nb_rx;
     rte_pktmbuf_free_bulk(pkts.data(), nb_rx);
   }
+  rte_eth_stats stats;
+  rte_eth_stats_get(info.port_id, &stats);
+  printf("missed %lu no %lu\n", stats.imissed, stats.rx_nombuf);
   printf("Packets received: %lu\n", rcvd);
   return 0;
 }
@@ -105,14 +107,17 @@ int main(int argc, char *argv[]) {
 
   switch (config.role) {
   case opmode::RECEIVE:
-    lcore_recv(&adapter);
+    launch_lcores(lcore_recv, &adapter);  
     break;
   case opmode::PONG:
-    lcore_pong(&adapter);
+    launch_lcores(lcore_pong, &adapter);
     break;
   default:
     break;
   }
+  rte_eth_stats stats{};
+  rte_eth_stats_get(info.port_id, &stats);
+  printf("%lu, %lu, %lu", stats.ipackets, stats.ierrors, stats.rx_nombuf);
   info.stop_port();
   DPDK_LIFETIME_END
   rte_eal_cleanup();

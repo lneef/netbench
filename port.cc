@@ -13,7 +13,6 @@
 #include <string.h>
 #include <string_view>
 #include <unordered_map>
-#include <iostream>
 
 #include "port.h"
 static std::unordered_map<std::string_view, opmode> opmodes{
@@ -32,14 +31,16 @@ static bool is_receiver(opmode role) {
          role == opmode::PONG;
 }
 
-static rte_mempool *pool_create(std::string_view name, uint32_t pool_sz, uint16_t lcore_id,
+static rte_mempool *pool_create(std::string_view name, uint32_t pool_sz,
+                                uint16_t lcore_id,
                                 uint32_t buf_sz = RTE_MBUF_DEFAULT_BUF_SIZE) {
   return rte_pktmbuf_pool_create(name.data(), pool_sz, MEMPOOL_CACHE_SIZE, 0,
                                  buf_sz, rte_lcore_to_socket_id(lcore_id));
 }
 
 static rte_mempool *setup_send_pool(opmode role, uint32_t pool_sz,
-                                 std::string_view name, uint16_t lcore_id, uint32_t msize) {
+                                    std::string_view name, uint16_t lcore_id,
+                                    uint32_t msize) {
   switch (role) {
   case opmode::PING:
   case opmode::FORWARD:
@@ -51,7 +52,8 @@ static rte_mempool *setup_send_pool(opmode role, uint32_t pool_sz,
 }
 
 static rte_mempool *setup_receive_pool(opmode role, uint32_t pool_sz,
-                                   std::string_view name, uint16_t lcore_id, uint32_t msize) {
+                                       std::string_view name, uint16_t lcore_id,
+                                       uint32_t msize) {
   switch (role) {
   case opmode::RECEIVE:
   case opmode::PING:
@@ -65,7 +67,8 @@ static rte_mempool *setup_receive_pool(opmode role, uint32_t pool_sz,
 
 static std::pair<rte_mempool *, rte_mempool *>
 alloc_pools(opmode role, uint32_t recv_pool_sz, uint32_t send_pool_sz,
-            std::string_view r_name, std::string_view s_name, uint16_t lcore_id, uint32_t msize) {
+            std::string_view r_name, std::string_view s_name, uint16_t lcore_id,
+            uint32_t msize) {
   return {setup_send_pool(role, send_pool_sz, s_name, lcore_id, msize),
           setup_receive_pool(role, recv_pool_sz, r_name, lcore_id, msize)};
 }
@@ -75,7 +78,7 @@ int benchmark_config::port_init_cmdline(int argc, char **argv) {
   static const struct option long_options[] = {
       {"dip", required_argument, 0, 0},
       {"sip", required_argument, 0, 0},
-      {"pktsize", required_argument, 0, 0},
+      {"mtu", required_argument, 0, 0},
       {"rt", required_argument, 0, 0},
       {"bs", required_argument, 0, 0},
       {"dmac", required_argument, 0, 0},
@@ -83,7 +86,6 @@ int benchmark_config::port_init_cmdline(int argc, char **argv) {
       {"flows", required_argument, 0, 0},
       {"ntx", required_argument, 0, 0},
       {"nrx", required_argument, 0, 0},
-      {"framesize", required_argument, 0, 0},
       {0, 0, 0, 0}};
   while ((opt = getopt_long(argc, argv, "", long_options, &option_index)) !=
          -1) {
@@ -97,7 +99,7 @@ int benchmark_config::port_init_cmdline(int argc, char **argv) {
       sip = inet_addr(optarg);
       break;
     case 2:
-      pktsize = atol(optarg);
+      mtu = atol(optarg);
       break;
     case 3:
       rtime = atol(optarg);
@@ -125,18 +127,35 @@ int benchmark_config::port_init_cmdline(int argc, char **argv) {
     case 9:
       nb_rx = atoi(optarg);
       break;
-    case 10:
-       pktsize = atoi(optarg) - sizeof(rte_ether_hdr) - RTE_ETHER_CRC_LEN; 
-       break;
     default:
       break;
     }
   }
-  mbuf_size = std::max<uint32_t>(pktsize + sizeof(rte_ether_hdr) + RTE_PKTMBUF_HEADROOM, mbuf_size);
+  mbuf_size = std::max<uint32_t>(
+      mtu + sizeof(rte_ether_hdr) + RTE_PKTMBUF_HEADROOM, mbuf_size);
   return 0;
 }
 
+static inline void setup_reta(uint16_t port, uint32_t nrx, uint32_t reta_size){
+    auto groups = reta_size / RTE_ETH_RETA_GROUP_SIZE;
+    std::vector<rte_eth_rss_reta_entry64> reta(groups);
+
+    for(auto i = 0u; i < reta_size; ++i)
+        reta[i / RTE_ETH_RETA_GROUP_SIZE].mask = UINT64_MAX;
+
+    for(auto i = 0u; i < reta_size; ++i){
+        uint32_t reta_id = i / RTE_ETH_RETA_GROUP_SIZE;
+        uint32_t reta_pos = i % RTE_ETH_RETA_GROUP_SIZE;
+        uint32_t rss_qid = i % nrx;
+        reta[reta_id].reta[reta_pos] = static_cast<uint16_t>(rss_qid);
+    }
+
+    if(rte_eth_dev_rss_reta_update(port, reta.data(), reta_size))
+        throw std::runtime_error(std::format("Could not update reta on port {}\n", port));
+}
+
 int benchmark_config::port_init(port_info &info) {
+  static constexpr uint16_t kDefaultDescNumTx = 1024;
   uint16_t nb_rxd, nb_txd;
   int retval;
   uint16_t port = info.port_id;
@@ -153,7 +172,7 @@ int benchmark_config::port_init(port_info &info) {
     throw std::runtime_error(
         std::format("Error during getting device info (port {})", port));
   nb_rxd = dev_info.rx_desc_lim.nb_max;
-  nb_txd = dev_info.tx_desc_lim.nb_max;
+  nb_txd = std::min(dev_info.tx_desc_lim.nb_max, kDefaultDescNumTx);
   info.max_desc_rxq = nb_rxd;
   info.max_desv_txq = nb_txd;
 
@@ -163,15 +182,13 @@ int benchmark_config::port_init(port_info &info) {
     port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
   if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_UDP_CKSUM)
     port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
-  if(dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_TSO){
-      std::cout << std::format("TSO supported\n") << std::flush;
-      port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_TCP_TSO;
-  }
 
   if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_UDP_CKSUM)
     port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_UDP_CKSUM;
   if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_IPV4_CKSUM)
     port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_IPV4_CKSUM;
+  if(dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_RSS_HASH)
+      dev_info.rx_offload_capa |= RTE_ETH_RX_OFFLOAD_RSS_HASH;
 
   info.caps.ip_cksum_tx =
       dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
@@ -184,7 +201,22 @@ int benchmark_config::port_init(port_info &info) {
       dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_UDP_CKSUM;
   nb_tx = is_sender(role) ? nb_tx : 0;
   nb_rx = is_receiver(role) ? nb_rx : 0;
-  retval = rte_eth_dev_configure(port, nb_threads * nb_rx, nb_threads * nb_tx, &port_conf);
+  rxconf.rx_deferred_start = false;
+  auto &rssconf = port_conf.rx_adv_conf.rss_conf;
+  bool rss = false;
+  if (nb_rx > 1 || nb_threads > 1) {
+    port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
+    rssconf.algorithm = RTE_ETH_HASH_FUNCTION_TOEPLITZ;
+    rssconf.rss_key = nullptr;
+    rssconf.rss_hf =
+        RTE_ETH_RSS_NONFRAG_IPV4_UDP & dev_info.flow_type_rss_offloads;
+    rss = true;
+  } else {
+    rssconf.rss_key = nullptr;
+    rssconf.rss_hf = 0;
+  }
+  retval = rte_eth_dev_configure(port, nb_threads * nb_rx, nb_threads * nb_tx,
+                                 &port_conf);
   if (retval != 0)
     throw std::runtime_error("Could not configure device");
 
@@ -200,23 +232,37 @@ int benchmark_config::port_init(port_info &info) {
   uint16_t lcore_id = 0;
   uint16_t setup_tx = 0;
   uint16_t setup_rx = 0;
-  RTE_LCORE_FOREACH(lcore_id){
-    auto& tb = info.thread_blocks[idx];  
+  RTE_LCORE_FOREACH(lcore_id) {
+    auto &tb = info.thread_blocks[idx];
     tb.s_name = std::format("SEND_POOL-{}", idx);
     tb.r_name = std::format("RECV_POOL-{}", idx++);
-    auto [send_pool, recv_pool] =
-        alloc_pools(role, static_cast<uint32_t>(nb_rx) * (nb_rxd + burst_size),
-                    static_cast<uint32_t>(nb_tx) * (nb_txd + burst_size), tb.r_name, tb.s_name, lcore_id, mbuf_size);
-    tb.setup_txqueues(port, nb_tx , nb_txd, txconf, send_pool, setup_tx);
-    tb.setup_rxqueues(port, nb_rx , nb_rxd, rxconf, recv_pool, setup_rx);
+    auto [send_pool, recv_pool] = alloc_pools(
+        role, static_cast<uint32_t>(nb_rx) * (nb_rxd + burst_size) + 4096,
+        static_cast<uint32_t>(nb_tx) * (nb_txd + burst_size), tb.r_name,
+        tb.s_name, lcore_id, mbuf_size);
+    tb.setup_txqueues(port, nb_tx, nb_txd, txconf, send_pool, setup_tx);
+    tb.setup_rxqueues(port, nb_rx, nb_rxd, rxconf, recv_pool, setup_rx);
     setup_tx += nb_tx;
     setup_rx += nb_rx;
   }
+
+  uint16_t preconfigured_mtu;
+  if (rte_eth_dev_get_mtu(port, &preconfigured_mtu))
+    throw std::runtime_error("Could not retrieve mtu\n");
+
+  if (preconfigured_mtu < mtu) {
+    retval = rte_eth_dev_set_mtu(port, mtu);
+    if (retval)
+      throw std::runtime_error(std::format("Could not set mtu to {}\n", mtu));
+  }
+
+  if(rss)
+      setup_reta(port, nb_rx * nb_threads, dev_info.reta_size);
   retval = rte_eth_dev_start(port);
-  rte_eth_macaddr_get(port, &info.addr);
   if (retval < 0)
     throw std::runtime_error(
         std::format("Could not start device: {}", strerror(-retval)));
+  rte_eth_macaddr_get(port, &info.addr);
   return 0;
 }
 

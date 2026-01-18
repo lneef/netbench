@@ -173,7 +173,6 @@ int main(int argc, char *argv[]) {
     submit_stat submit_stats{};
     stat stats{};
     launch_lcores(lcore_ping, &adapter);
-    lcore_ping(&adapter);
     info.collect_statistics(stats);
     info.collect_submit_statistics(submit_stats);
     print_stats(stats, submit_stats, config);

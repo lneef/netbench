@@ -56,7 +56,7 @@ void packet_generator::packet_ipv4_ctor(pkt_t *mbuf, struct rte_ipv4_hdr *ipv4,
 }
 
 void packet_generator::packet_pp_ctor_udp(pkt_t *mbuf) {
-  packet_pp_ctor_udp(mbuf, config.pktsize - PKT_HDR_SIZE);
+  packet_pp_ctor_udp(mbuf, config.mtu - PKT_HDR_SIZE);
 }
 
 void packet_generator::packet_pp_ctor_udp(pkt_t *mbuf, std::size_t msg_size) {
@@ -70,37 +70,6 @@ void packet_generator::packet_pp_ctor_udp(pkt_t *mbuf, std::size_t msg_size) {
   packet_ipv4_ctor(mbuf, ipv4, payload += sizeof(struct rte_ipv4_hdr));
   packet_eth_ctor(mbuf, eth);
   mbuf->nb_segs = 1;
-}
-
-void packet_generator::packet_pp_ctor_tcp(pkt_t *mbuf){
-    packet_pp_ctor_tcp(mbuf, config.pktsize);
-}
-
-void packet_generator::packet_pp_ctor_tcp(pkt_t *mbuf, std::size_t pktsize) {
-  auto *eth = rte_pktmbuf_mtod(mbuf, rte_ether_hdr *);
-  auto *ipv4 = reinterpret_cast<rte_ipv4_hdr *>(eth + 1);
-  auto *tcp = reinterpret_cast<rte_tcp_hdr *>(ipv4 + 1);
-  mbuf->pkt_len = 0;
-  mbuf->data_len = 0;
-  tcp->data_off = sizeof(rte_tcp_hdr) / (sizeof(uint32_t));  
-  tcp->src_port = rte_cpu_to_be_16(flow * rte_lcore_count() + tid);
-  tcp->dst_port = rte_cpu_to_be_16(flow);
-  tcp->sent_seq = 64;
-  tcp->recv_ack = 32;
-  tcp->tcp_flags = 0;
-  tcp->tcp_flags |= RTE_TCP_ACK_FLAG;
-  tcp->tcp_urp = 0;
-  flow = (flow + 1) % config.flows; 
-  mbuf->pkt_len = pktsize - sizeof(*ipv4);
-  mbuf->data_len = mbuf->pkt_len;
-  packet_ipv4_ctor(mbuf, ipv4, mbuf->pkt_len);
-  packet_eth_ctor(mbuf, eth);
-  mbuf->nb_segs = 1;
-  mbuf->tso_segsz = RTE_ETHER_MIN_LEN - sizeof(*ipv4) - sizeof(*tcp);
-  mbuf->l4_len = sizeof(*tcp);
-  mbuf->ol_flags = RTE_MBUF_F_TX_TCP_SEG | RTE_MBUF_F_TX_IPV4 |
-                   RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_TCP_CKSUM;
-  tcp->cksum = rte_ipv4_phdr_cksum(ipv4, mbuf->ol_flags);
 }
 
 bool packet_generator::packet_pong_ctor(pkt_t *pkt) {
@@ -200,13 +169,5 @@ void packet_mempool_ctor_full(struct rte_mempool *mp, void *opaque, void *obj,
   pg->packet_ipv4_udp_cksum(mbuf);
   mbuf->pool = mp;
   mbuf->next = NULL;
-}
-
-void packet_mempool_ctor_full_tcp(rte_mempool *mp, void *opaque, void *obj, unsigned int obj_idx __rte_unused){
-    auto *pkt = static_cast<pkt_t*>(obj);
-    packet_generator *pg = static_cast<packet_generator*>(opaque);
-    pg->packet_pp_ctor_tcp(pkt);
-    pkt->pool = mp;
-    pkt->next = nullptr;
 }
 

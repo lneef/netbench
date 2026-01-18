@@ -32,10 +32,6 @@ public:
 
   void packet_pp_ctor_udp(pkt_t *mbuf, std::size_t msg_size);
 
-  void packet_pp_ctor_tcp(pkt_t *mbuf, std::size_t msg_size);
-
-  void packet_pp_ctor_tcp(pkt_t *mbuf);
-
   bool packet_pong_ctor(pkt_t *pkt);
 
   void packet_ipv4_cksum(pkt_t *mbuf);
@@ -61,7 +57,4 @@ void packet_mempool_ctor(rte_mempool *mp, void *opaque, void *obj,
 
 void packet_mempool_ctor_full(rte_mempool *mp, void *opaque, void *obj,
                               unsigned int obj_idx __rte_unused);
-
-void packet_mempool_ctor_full_tcp(rte_mempool *mp, void *opaque, void *obj,
-                                  unsigned int obj_idx);
 #endif

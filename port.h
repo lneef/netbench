@@ -42,10 +42,10 @@ struct port_info;
 struct benchmark_config {
   static constexpr uint16_t DEFAULT_BURST_SIZE = 32;
   static constexpr uint64_t DEFAULT_RTIME = 1;
-  static constexpr uint16_t DEFAULT_PKT_SIZE =
+  static constexpr uint16_t DEFAULT_MTU_SIZE =
       RTE_ETHER_MIN_LEN - RTE_ETHER_CRC_LEN - sizeof(rte_ether_hdr);
   uint32_t sip, dip;
-  uint32_t pktsize;
+  uint16_t mtu;
   uint64_t rtime;
   uint16_t burst_size;
   uint16_t flows;
@@ -55,7 +55,7 @@ struct benchmark_config {
   rte_ether_addr dmac;
   opmode role;
   benchmark_config()
-      : pktsize(DEFAULT_PKT_SIZE), rtime(DEFAULT_RTIME),
+      : mtu(DEFAULT_MTU_SIZE), rtime(DEFAULT_RTIME),
         burst_size(DEFAULT_BURST_SIZE), flows(1), nb_threads(1), nb_tx(1),
         nb_rx(1), mbuf_size(RTE_MBUF_DEFAULT_BUF_SIZE) {}
   int port_init_cmdline(int argc, char **argv);
