@@ -206,7 +206,7 @@ int benchmark_config::port_init(port_info &info) {
   bool rss = false;
   if (nb_rx > 1 || nb_threads > 1) {
     port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
-    rssconf.algorithm = RTE_ETH_HASH_FUNCTION_TOEPLITZ;
+    rssconf.algorithm = RTE_ETH_HASH_FUNCTION_DEFAULT;
     rssconf.rss_key = nullptr;
     rssconf.rss_hf =
         RTE_ETH_RSS_NONFRAG_IPV4_UDP & dev_info.flow_type_rss_offloads;
