@@ -15,6 +15,15 @@
 #include <unordered_map>
 
 #include "port.h"
+
+static uint8_t RSS_DEFAULT_KEY[] = {
+    0xbe, 0xac, 0x01, 0xfa, 0x6a, 0x42, 0xb7, 0x3b, 0x80, 0x30,
+    0xf2, 0x0c, 0x77, 0xcb, 0x2d, 0xa3, 0xae, 0x7b, 0x30, 0xb4,
+    0xd0, 0xca, 0x2b, 0xcb, 0x43, 0xa3, 0x8f, 0xb0, 0x41, 0x67,
+    0x25, 0x3d, 0x25, 0x5b, 0x0e, 0xc2, 0x6d, 0x5a, 0x56, 0xda};
+
+static constexpr unsigned RSS_KEY_LEN = 40;
+
 static std::unordered_map<std::string_view, opmode> opmodes{
     {"PING", opmode::PING},
     {"PONG", opmode::PONG},
@@ -207,7 +216,8 @@ int benchmark_config::port_init(port_info &info) {
   if (nb_rx > 1 || nb_threads > 1) {
     port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
     rssconf.algorithm = RTE_ETH_HASH_FUNCTION_DEFAULT;
-    rssconf.rss_key = nullptr;
+    rssconf.rss_key = RSS_DEFAULT_KEY;
+    rssconf.rss_key_len = RSS_KEY_LEN;
     rssconf.rss_hf =
         RTE_ETH_RSS_NONFRAG_IPV4_UDP & dev_info.flow_type_rss_offloads;
     rss = true;
@@ -256,9 +266,9 @@ int benchmark_config::port_init(port_info &info) {
       throw std::runtime_error(std::format("Could not set mtu to {}\n", mtu));
   }
 
+  retval = rte_eth_dev_start(port);
   if(rss)
       setup_reta(port, nb_rx * nb_threads, dev_info.reta_size);
-  retval = rte_eth_dev_start(port);
   if (retval < 0)
     throw std::runtime_error(
         std::format("Could not start device: {}", strerror(-retval)));

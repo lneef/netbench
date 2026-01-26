@@ -118,7 +118,6 @@ struct sender_entry {
   bool requires_retry(uint64_t now, uint64_t rto) {
     return now > get_ts(packet) + rto;
   }
-  bool is_free() { return packet == nullptr; }
   pkt_t *get() { return packet; }
 
   sender_entry(const sender_entry &) = delete;
@@ -223,8 +222,7 @@ struct window {
 
   void advance(std::invocable<uint64_t> auto &&...f) {
     assert(mask + 1 == wd.size());
-    auto i = index(least_in_window);
-    while (wd[i]) {
+    while (wd[lb]) {
       if ((least_in_window & mask) == 0) {
         last_round = round;
         round = rte_get_timer_cycles();
