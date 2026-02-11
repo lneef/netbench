@@ -213,7 +213,7 @@ int benchmark_config::port_init(port_info &info) {
   rxconf.rx_deferred_start = false;
   auto &rssconf = port_conf.rx_adv_conf.rss_conf;
   bool rss = false;
-  if (nb_rx > 1 || nb_threads > 1) {
+  if (nb_rx * nb_threads > 1) {
     port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
     rssconf.algorithm = RTE_ETH_HASH_FUNCTION_DEFAULT;
     rssconf.rss_key = RSS_DEFAULT_KEY;
