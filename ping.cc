@@ -86,7 +86,7 @@ static void print_stats(stat &statistics, submit_stat &submit_statistics,
 int lcore_ping(void *port) {
   auto &[info, config] = *static_cast<lcore_adapter *>(port);
   auto &tb = info.local();
-  packet_generator pg(info.caps, info, config);
+  packet_generator<> pg(info.caps, info, config);
   std::vector<pkt_t *> pkts(config.burst_size);
   std::vector<pkt_t *> rpkts(config.burst_size);
   auto tx_queue = tb.tx_queues.front();
@@ -124,7 +124,7 @@ template <bool mq, typename L4> int lcore_send(void *port) {
   auto &[info, config] = *static_cast<lcore_adapter *>(port);
   uint16_t tx_free = config.burst_size * config.nb_tx, tx_nb;
   auto &tb = info.local();
-  packet_generator pg(info.caps, info, config);
+  packet_generator<L4> pg(info.caps, info, config);
   std::vector<pkt_t *> pkts(tx_free);
   rte_mempool_obj_iter(tb.send_pool.get(), packet_mempool_ctor_full<L4>, &pg);
   uint64_t cycles = rte_get_timer_cycles();

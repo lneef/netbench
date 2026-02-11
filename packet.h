@@ -11,6 +11,7 @@
 #include <rte_mbuf_core.h>
 #include <rte_tcp.h>
 #include <rte_udp.h>
+#include <type_traits>
 
 #include "port.h"
 
@@ -165,7 +166,6 @@ public:
     ipv4->total_length = rte_cpu_to_be_16(total_length);
     ipv4->packet_id = 0;
     ipv4->fragment_offset = 0;
-    ipv4->type_of_service = 0;
     ipv4->hdr_checksum = 0;
     ipv4->type_of_service = 0x02;
     mbuf->l3_len = sizeof(struct rte_ipv4_hdr);
@@ -185,6 +185,7 @@ public:
   }
 
   bool packet_pong_ctor(pkt_t *pkt) {
+    static_assert(std::is_same_v<L4, udp_builder>, "No Tcp Supported");  
     struct rte_ether_hdr *eth = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
     struct rte_ipv4_hdr *ipv4 = (struct rte_ipv4_hdr *)(eth + 1);
     struct rte_udp_hdr *udp = (struct rte_udp_hdr *)(ipv4 + 1);
