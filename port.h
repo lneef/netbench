@@ -33,6 +33,8 @@
 
 enum class opmode { PING, PONG, FORWARD, RECEIVE };
 
+enum class l4 {UDP, TCP};
+
 struct capabilities {
   bool ip_cksum_tx, ip_cksum_rx;
   bool l4_cksum_tx, l4_cksum_rx;
@@ -52,6 +54,8 @@ struct benchmark_config {
   uint16_t nb_threads;
   uint16_t nb_tx, nb_rx;
   uint32_t mbuf_size;
+  uint16_t tcp_mss = 0;
+  l4 transport = l4::UDP;
   rte_ether_addr dmac;
   opmode role;
   benchmark_config()

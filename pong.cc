@@ -33,7 +33,7 @@ static void handler(int sig) {
   terminate = 1;
 }
 
-static bool handle_packet(packet_generator &pg, pkt_t *pkt) {
+static bool handle_packet(packet_generator<> &pg, pkt_t *pkt) {
   struct rte_ether_hdr *eth = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
   switch (rte_be_to_cpu_16(eth->ether_type)) {
   case RTE_ETHER_TYPE_IPV4:

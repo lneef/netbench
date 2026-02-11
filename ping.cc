@@ -29,14 +29,14 @@
 #include "statistics.h"
 #include "util.h"
 
-static uint16_t handle_pong_rdtsc(packet_generator &pg, stat &statistics,
+static uint16_t handle_pong_rdtsc(packet_generator<> &pg, stat &statistics,
                                   std::span<pkt_t *> pkts, uint16_t nb_rx) {
   struct pkt_content_rdtsc pc, rc;
   uint64_t elapsed = 0;
   uint16_t rx_count = 0;
   pc.time = rte_get_timer_cycles();
   for (auto *pkt : pkts.subspan(0, nb_rx)) {
-    uint8_t *data = rte_pktmbuf_mtod_offset(pkt, uint8_t *, HDR_SIZE);
+    uint8_t *data = rte_pktmbuf_mtod_offset(pkt, uint8_t *, pg.data_offset());
     if (!pg.packet_verify_ipv4(pkt) || !pg.packet_verify_rs(pkt))
       continue;
     ++rx_count;
@@ -54,18 +54,20 @@ static uint16_t handle_pong_rdtsc(packet_generator &pg, stat &statistics,
   return rx_count;
 }
 
-static void add_timestamp_rtdsc(packet_generator &pg, std::span<pkt_t *> pkts) {
+static void add_timestamp_rtdsc(packet_generator<> &pg,
+                                std::span<pkt_t *> pkts) {
   struct pkt_content_rdtsc pc = {.time = rte_get_timer_cycles()};
   for (auto *pkt : pkts) {
-    uint8_t *data = rte_pktmbuf_mtod_offset(pkt, uint8_t *, HDR_SIZE);
+    uint8_t *data = rte_pktmbuf_mtod_offset(pkt, uint8_t *, pg.data_offset());
     PUN(data, &pc, typeof(pc));
-    pg.packet_ipv4_udp_cksum(pkt);
+    pg.packet_cksum(pkt);
   }
 }
 
 static void print_submit_stat(submit_stat &submit_statistics,
                               [[maybe_unused]] benchmark_config &config) {
-  printf("Submitted PPS: %.2f\n",(double)(submit_statistics.submitted) / config.rtime);
+  printf("Submitted PPS: %.2f\n",
+         (double)(submit_statistics.submitted) / config.rtime);
 }
 
 static void print_stats(stat &statistics, submit_stat &submit_statistics,
@@ -88,9 +90,10 @@ int lcore_ping(void *port) {
   std::vector<pkt_t *> pkts(config.burst_size);
   std::vector<pkt_t *> rpkts(config.burst_size);
   auto tx_queue = tb.tx_queues.front();
-  auto rx_queue = tb.tx_queues.front();
+  auto rx_queue = tb.rx_queues.front();
 
-  rte_mempool_obj_iter(tb.send_pool.get(), packet_mempool_ctor, &pg);
+  rte_mempool_obj_iter(tb.send_pool.get(), packet_mempool_ctor<udp_builder>,
+                       &pg);
   uint16_t tx_nb = config.burst_size;
   uint64_t cycles = rte_get_timer_cycles();
   uint64_t end = config.rtime * rte_get_timer_hz() + cycles;
@@ -117,13 +120,13 @@ int lcore_ping(void *port) {
   return 0;
 }
 
-template <bool mq> int lcore_send(void *port) {
+template <bool mq, typename L4> int lcore_send(void *port) {
   auto &[info, config] = *static_cast<lcore_adapter *>(port);
   uint16_t tx_free = config.burst_size * config.nb_tx, tx_nb;
   auto &tb = info.local();
   packet_generator pg(info.caps, info, config);
   std::vector<pkt_t *> pkts(tx_free);
-  rte_mempool_obj_iter(tb.send_pool.get(), packet_mempool_ctor_full, &pg);
+  rte_mempool_obj_iter(tb.send_pool.get(), packet_mempool_ctor_full<L4>, &pg);
   uint64_t cycles = rte_get_timer_cycles();
   uint64_t end = config.rtime * rte_get_timer_hz() + cycles;
   for (; cycles < end; cycles = rte_get_timer_cycles()) {
@@ -139,14 +142,35 @@ template <bool mq> int lcore_send(void *port) {
                                   pkts.data() + tx_free + tx_nb, burst_size);
       }
     } else {
-      tx_nb = rte_eth_tx_burst(info.port_id, tb.tx_queues.front(),
-                               pkts.data() + tx_free, config.burst_size - tx_free);
+      tx_nb =
+          rte_eth_tx_burst(info.port_id, tb.tx_queues.front(),
+                           pkts.data() + tx_free, config.burst_size - tx_free);
     }
     tx_free += tx_nb;
     tb.per_thread_submit_stat.submitted += tx_nb;
   }
   sleep(3);
   return 0;
+}
+
+void launch_forward(lcore_adapter &adapter) {
+  auto &config = adapter.config;
+  switch (config.transport) {
+  case l4::UDP: {
+    if (config.nb_tx > 1)
+      launch_lcores(lcore_send<true, udp_builder>, &adapter);
+    else
+      launch_lcores(lcore_send<false, udp_builder>, &adapter);
+    break;
+  }
+  case l4::TCP: {
+    if (config.nb_tx > 1)
+      launch_lcores(lcore_send<true, tcp_builder>, &adapter);
+    else
+      launch_lcores(lcore_send<false, tcp_builder>, &adapter);
+    break;
+  }
+  }
 }
 
 int main(int argc, char *argv[]) {
@@ -161,10 +185,7 @@ int main(int argc, char *argv[]) {
   switch (config.role) {
   case opmode::FORWARD: {
     submit_stat submit_stats{};
-    if (config.nb_tx > 1)
-      launch_lcores(lcore_send<true>, &adapter);
-    else
-      launch_lcores(lcore_send<false>, &adapter);
+    launch_forward(adapter);
     info.collect_submit_statistics(submit_stats);
     print_submit_stat(submit_stats, config);
     break;

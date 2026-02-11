@@ -1,4 +1,3 @@
-#include <cassert>
 #include <cstdint>
 #include <cstdlib>
 #include <format>
@@ -95,6 +94,7 @@ int benchmark_config::port_init_cmdline(int argc, char **argv) {
       {"flows", required_argument, 0, 0},
       {"ntx", required_argument, 0, 0},
       {"nrx", required_argument, 0, 0},
+      {"tcp", required_argument, 0, 0},
       {0, 0, 0, 0}};
   while ((opt = getopt_long(argc, argv, "", long_options, &option_index)) !=
          -1) {
@@ -136,6 +136,9 @@ int benchmark_config::port_init_cmdline(int argc, char **argv) {
     case 9:
       nb_rx = atoi(optarg);
       break;
+    case 10:
+      tcp_mss = atoi(optarg);
+      transport = l4::TCP;
     default:
       break;
     }
@@ -191,6 +194,8 @@ int benchmark_config::port_init(port_info &info) {
     port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
   if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_UDP_CKSUM)
     port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
+  if(dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_TSO)
+      port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_TCP_TSO;
 
   if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_UDP_CKSUM)
     port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_UDP_CKSUM;
@@ -208,6 +213,10 @@ int benchmark_config::port_init(port_info &info) {
       dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_IPV4_CKSUM;
   info.caps.ip_cksum_tx =
       dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_UDP_CKSUM;
+
+  if(transport == l4::TCP && !(port_conf.txmode.offloads & RTE_ETH_TX_OFFLOAD_TCP_TSO))
+      throw std::runtime_error("TCP without tso not supported");
+
   nb_tx = is_sender(role) ? nb_tx : 0;
   nb_rx = is_receiver(role) ? nb_rx : 0;
   rxconf.rx_deferred_start = false;

@@ -8,17 +8,12 @@ add_project_arguments('-D_POSIX_C_SOURCE=200809L', language: 'c')
 add_project_arguments('-Wpedantic', language: 'c')
 
 sources_ping = files('ping.cc',
-  'packet.cc',
   'port.cc',
   'util.cc')
 sources_pong = files('pong.cc',
-  'packet.cc',
   'port.cc',
   'util.cc')
-sources_rudp = files('rudp.cc',
-  'packet.cc',
-  'port.cc',
-  'util.cc')
+
 executable('dpdk-ping', sources_ping, dependencies: dpdk_dep, link_args: ['-lcap', '-Wl,--allow-multiple-definition', '-Wl,--whole-archive'])
 executable('dpdk-pong', sources_pong, dependencies: dpdk_dep, link_args: ['-lcap', '-Wl,--allow-multiple-definition', '-Wl,--whole-archive'])
-executable('dpdk-rudp', sources_rudp, dependencies: dpdk_dep, link_args: ['-lcap', '-Wl,--allow-multiple-definition', '-Wl,--whole-archive'])
+
