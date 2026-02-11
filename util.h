@@ -77,4 +77,5 @@ struct dpdk_allocator{
 
 template<typename T>
 using aligned_vector = std::vector<padded<T>, dpdk_allocator<padded<T>>>;
+
 #endif

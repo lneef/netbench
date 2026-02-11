@@ -98,6 +98,35 @@ def toeplitz_key_type(str):
 
     return [int(key_elem, 16) for key_elem in str.split(':')]
 
+def find_sport_per_peer(rx_ip, rx_port, tx_ip, n, key=None):
+    """Find a source port for each peer such that each peer obtains a different
+    ReTa entry modulo n.
+
+    For peer i, the returned source port will produce a hash where
+    hash % 128 % n == i.
+
+    Returns a list of n source ports, one per peer.
+    """
+    if key is None:
+        key = RSS_DEFAULT_KEY
+
+    results = [None] * n 
+    found = 0
+
+    for sport in range(0, 65535):
+        tx_port = [(sport & 0xff00) >> 8, sport & 0x00ff]
+        hash_val = calculate_hash(rx_ip, rx_port, tx_ip, tx_port, 0, list(key))
+        entry = hash_val % 128
+        peer = entry % n
+
+        if results[peer] is None:
+            results[peer] = sport
+            found += 1
+            if found == n:
+                break
+
+    return results
+
 def main():
 
     parser = argparse.ArgumentParser(description='ENA Toeplitz hash calculator',
@@ -111,6 +140,8 @@ def main():
     parser.add_argument('-t', '--tx-ip', help='Transmitting side ipv4',
                         dest='tx_ip', nargs='?', required=True, type=ipv4_addr_type)
     parser.add_argument('-T', '--tx-port', help='Transmitting side port', dest='tx_port', nargs='?',
+                        required=True, type=int)
+    parser.add_argument('-n', '--n', help='Number of peers', dest='n', nargs='?',
                         required=True, type=int)
 
     args = parser.parse_args()
@@ -138,6 +169,10 @@ def main():
 
     # DPDK and freeBSD drivers follow the standard implementation
     print("DPDK".ljust(50), f"\t{hex(hash)} (RSS table entry: {rss_table_entry})")
+
+    ports = find_sport_per_peer(rx_ip, rx_port, tx_ip, args.n)
+
+    print(ports)
 
 if __name__ == '__main__':
     main()

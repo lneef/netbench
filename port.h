@@ -100,3 +100,14 @@ struct port_info {
 
   void collect_submit_statistics(submit_stat &statistics);
 };
+
+inline void print_stats(port_info& info){
+  auto n = rte_eth_xstats_get_names(info.port_id, nullptr, 0);
+  std::vector<rte_eth_xstat_name> names(n);
+  std::vector<rte_eth_xstat> xstats(n);
+  rte_eth_xstats_get_names(info.port_id, names.data(), n);
+  rte_eth_xstats_get(info.port_id, xstats.data(), n);
+  for(auto& xstat : xstats)
+          printf("%s: %lu\n", names[xstat.id].name, xstat.value);
+
+}

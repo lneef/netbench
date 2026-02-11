@@ -76,19 +76,13 @@ static int lcore_recv(void *port) {
   std::vector<pkt_t *> pkts(config.burst_size * config.nb_rx);
   auto &tb = info.local();
   uint16_t nb_rx;
-  uint64_t rcvd = 0;
   for (; !terminate;) {
     nb_rx = 0;
     for (auto qid : tb.rx_queues)
       nb_rx +=
           rte_eth_rx_burst(info.port_id, qid, pkts.data() + nb_rx, config.burst_size);
-    rcvd += nb_rx;
     rte_pktmbuf_free_bulk(pkts.data(), nb_rx);
   }
-  rte_eth_stats stats;
-  rte_eth_stats_get(info.port_id, &stats);
-  printf("missed %lu no %lu\n", stats.imissed, stats.rx_nombuf);
-  printf("Packets received: %lu\n", rcvd);
   return 0;
 }
 
@@ -115,9 +109,7 @@ int main(int argc, char *argv[]) {
   default:
     break;
   }
-  rte_eth_stats stats{};
-  rte_eth_stats_get(info.port_id, &stats);
-  printf("%lu, %lu, %lu", stats.ipackets, stats.ierrors, stats.rx_nombuf);
+  print_stats(info);
   info.stop_port();
   DPDK_LIFETIME_END
   rte_eal_cleanup();

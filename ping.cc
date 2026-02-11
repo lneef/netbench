@@ -181,13 +181,7 @@ int main(int argc, char *argv[]) {
   default:
     break;
   }
-  auto n = rte_eth_xstats_get_names(info.port_id, nullptr, 0);
-  std::vector<rte_eth_xstat_name> names(n);
-  std::vector<rte_eth_xstat> xstats(n);
-  rte_eth_xstats_get_names(info.port_id, names.data(), n);
-  rte_eth_xstats_get(info.port_id, xstats.data(), n);
-  for(auto& xstat : xstats)
-          printf("%s: %lu\n", names[xstat.id].name, xstat.value);
+  print_stats(info);
   info.stop_port();
   DPDK_LIFETIME_END
   rte_eal_cleanup();
