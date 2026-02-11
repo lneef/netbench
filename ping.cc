@@ -65,7 +65,7 @@ static void add_timestamp_rtdsc(packet_generator &pg, std::span<pkt_t *> pkts) {
 
 static void print_submit_stat(submit_stat &submit_statistics,
                               [[maybe_unused]] benchmark_config &config) {
-  printf("Submitted PPS: %.2f\n",(double)(submit_statistics.submitted));
+  printf("Submitted PPS: %.2f\n",(double)(submit_statistics.submitted) / config.rtime);
 }
 
 static void print_stats(stat &statistics, submit_stat &submit_statistics,
