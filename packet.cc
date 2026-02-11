@@ -27,8 +27,9 @@ void packet_generator::packet_eth_ctor(pkt_t *mbuf, rte_ether_hdr *eth) {
 
 void packet_generator::packet_udp_ctor(pkt_t *mbuf, rte_udp_hdr *udp,
                                        uint16_t dgram_len) {
+  static constexpr uint16_t kDefaultRxPort = 12345;  
   udp->src_port = rte_cpu_to_be_16(flow * rte_lcore_count() + tid);
-  udp->dst_port = rte_cpu_to_be_16(flow);
+  udp->dst_port = rte_cpu_to_be_16(kDefaultRxPort);
   udp->dgram_len = rte_cpu_to_be_16(dgram_len);
   udp->dgram_cksum = 0;
   mbuf->l4_len = sizeof(struct rte_udp_hdr);
