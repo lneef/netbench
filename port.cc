@@ -29,11 +29,6 @@ static std::unordered_map<std::string_view, opmode> opmodes{
     {"FORWARD", opmode::FORWARD},
     {"RECEIVE", opmode::RECEIVE}};
 
-static bool is_sender(opmode role) {
-  return role == opmode::FORWARD || role == opmode::PING ||
-         role == opmode::PONG;
-}
-
 static bool is_receiver(opmode role) {
   return role == opmode::RECEIVE || role == opmode::PING ||
          role == opmode::PONG;
@@ -84,18 +79,12 @@ alloc_pools(opmode role, uint32_t recv_pool_sz, uint32_t send_pool_sz,
 int benchmark_config::port_init_cmdline(int argc, char **argv) {
   int opt, option_index;
   static const struct option long_options[] = {
-      {"dip", required_argument, 0, 0},
-      {"sip", required_argument, 0, 0},
-      {"mtu", required_argument, 0, 0},
-      {"rt", required_argument, 0, 0},
-      {"bs", required_argument, 0, 0},
-      {"dmac", required_argument, 0, 0},
-      {"mode", required_argument, 0, 0},
-      {"flows", required_argument, 0, 0},
-      {"ntx", required_argument, 0, 0},
-      {"nrx", required_argument, 0, 0},
-      {"tcp", required_argument, 0, 0},
-      {0, 0, 0, 0}};
+      {"dip", required_argument, 0, 0},  {"sip", required_argument, 0, 0},
+      {"mtu", required_argument, 0, 0},  {"rt", required_argument, 0, 0},
+      {"bs", required_argument, 0, 0},   {"dmac", required_argument, 0, 0},
+      {"mode", required_argument, 0, 0}, {"flows", required_argument, 0, 0},
+      {"ntx", required_argument, 0, 0},  {"nrx", required_argument, 0, 0},
+      {"tcp", required_argument, 0, 0},  {0, 0, 0, 0}};
   while ((opt = getopt_long(argc, argv, "", long_options, &option_index)) !=
          -1) {
     if (opt == '?')
@@ -148,22 +137,23 @@ int benchmark_config::port_init_cmdline(int argc, char **argv) {
   return 0;
 }
 
-static inline void setup_reta(uint16_t port, uint32_t nrx, uint32_t reta_size){
-    auto groups = reta_size / RTE_ETH_RETA_GROUP_SIZE;
-    std::vector<rte_eth_rss_reta_entry64> reta(groups);
+static inline void setup_reta(uint16_t port, uint32_t nrx, uint32_t reta_size) {
+  auto groups = reta_size / RTE_ETH_RETA_GROUP_SIZE;
+  std::vector<rte_eth_rss_reta_entry64> reta(groups);
 
-    for(auto i = 0u; i < reta_size; ++i)
-        reta[i / RTE_ETH_RETA_GROUP_SIZE].mask = UINT64_MAX;
+  for (auto i = 0u; i < reta_size; ++i)
+    reta[i / RTE_ETH_RETA_GROUP_SIZE].mask = UINT64_MAX;
 
-    for(auto i = 0u; i < reta_size; ++i){
-        uint32_t reta_id = i / RTE_ETH_RETA_GROUP_SIZE;
-        uint32_t reta_pos = i % RTE_ETH_RETA_GROUP_SIZE;
-        uint32_t rss_qid = i % nrx;
-        reta[reta_id].reta[reta_pos] = static_cast<uint16_t>(rss_qid);
-    }
+  for (auto i = 0u; i < reta_size; ++i) {
+    uint32_t reta_id = i / RTE_ETH_RETA_GROUP_SIZE;
+    uint32_t reta_pos = i % RTE_ETH_RETA_GROUP_SIZE;
+    uint32_t rss_qid = i % nrx;
+    reta[reta_id].reta[reta_pos] = static_cast<uint16_t>(rss_qid);
+  }
 
-    if(rte_eth_dev_rss_reta_update(port, reta.data(), reta_size))
-        throw std::runtime_error(std::format("Could not update reta on port {}\n", port));
+  if (rte_eth_dev_rss_reta_update(port, reta.data(), reta_size))
+    throw std::runtime_error(
+        std::format("Could not update reta on port {}\n", port));
 }
 
 int benchmark_config::port_init(port_info &info) {
@@ -194,15 +184,13 @@ int benchmark_config::port_init(port_info &info) {
     port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
   if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_UDP_CKSUM)
     port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
-  if(dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_TSO)
-      port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_TCP_TSO;
+  if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_TSO)
+    port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_TCP_TSO;
 
   if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_UDP_CKSUM)
     port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_UDP_CKSUM;
   if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_IPV4_CKSUM)
     port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_IPV4_CKSUM;
-  if(dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_RSS_HASH)
-      dev_info.rx_offload_capa |= RTE_ETH_RX_OFFLOAD_RSS_HASH;
 
   info.caps.ip_cksum_tx =
       dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
@@ -211,24 +199,35 @@ int benchmark_config::port_init(port_info &info) {
 
   info.caps.ip_cksum_rx =
       dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_IPV4_CKSUM;
-  info.caps.ip_cksum_tx =
+  info.caps.l4_cksum_rx =
       dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_UDP_CKSUM;
 
-  if(transport == l4::TCP && !(port_conf.txmode.offloads & RTE_ETH_TX_OFFLOAD_TCP_TSO))
-      throw std::runtime_error("TCP without tso not supported");
+  if (transport == l4::TCP &&
+      !(port_conf.txmode.offloads & RTE_ETH_TX_OFFLOAD_TCP_TSO))
+    throw std::runtime_error("TCP without tso not supported");
 
-  nb_tx = is_sender(role) ? nb_tx : 0;
+  // Some NICs dont work sole with rx queues
+  // We only adjust RX
   nb_rx = is_receiver(role) ? nb_rx : 0;
   rxconf.rx_deferred_start = false;
   auto &rssconf = port_conf.rx_adv_conf.rss_conf;
-  bool rss = false;
-  if (nb_rx * nb_threads > 1) {
+  bool rss = nb_rx * nb_threads > 1;
+
+  if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_RSS_HASH && rss)
+    port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_RSS_HASH;
+  else
+      rss = false;
+
+  if (rss) {
     port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
     rssconf.algorithm = RTE_ETH_HASH_FUNCTION_DEFAULT;
-    rssconf.rss_key = RSS_DEFAULT_KEY;
-    rssconf.rss_key_len = RSS_KEY_LEN;
+    if (dev_info.hash_key_size == RSS_KEY_LEN) {
+      rssconf.rss_key = RSS_DEFAULT_KEY;
+      rssconf.rss_key_len = RSS_KEY_LEN;
+    }
     rssconf.rss_hf =
-        RTE_ETH_RSS_NONFRAG_IPV4_UDP & dev_info.flow_type_rss_offloads;
+        (RTE_ETH_RSS_NONFRAG_IPV4_UDP & dev_info.flow_type_rss_offloads) |
+        (dev_info.flow_type_rss_offloads & RTE_ETH_RSS_NONFRAG_IPV4_TCP);
     rss = true;
   } else {
     rssconf.rss_key = nullptr;
@@ -255,10 +254,10 @@ int benchmark_config::port_init(port_info &info) {
     auto &tb = info.thread_blocks[idx];
     tb.s_name = std::format("SEND_POOL-{}", idx);
     tb.r_name = std::format("RECV_POOL-{}", idx++);
-    auto [send_pool, recv_pool] = alloc_pools(
-        role, static_cast<uint32_t>(nb_rx) * (nb_rxd + burst_size) + 4096,
-        static_cast<uint32_t>(nb_tx) * (nb_txd + burst_size), tb.r_name,
-        tb.s_name, lcore_id, mbuf_size);
+    auto [send_pool, recv_pool] =
+        alloc_pools(role, static_cast<uint32_t>(nb_rx) * (nb_rxd + burst_size),
+                    static_cast<uint32_t>(nb_tx) * (nb_txd + burst_size),
+                    tb.r_name, tb.s_name, lcore_id, mbuf_size);
     tb.setup_txqueues(port, nb_tx, nb_txd, txconf, send_pool, setup_tx);
     tb.setup_rxqueues(port, nb_rx, nb_rxd, rxconf, recv_pool, setup_rx);
     setup_tx += nb_tx;
@@ -276,8 +275,8 @@ int benchmark_config::port_init(port_info &info) {
   }
 
   retval = rte_eth_dev_start(port);
-  if(rss)
-      setup_reta(port, nb_rx * nb_threads, dev_info.reta_size);
+  if (rss)
+    setup_reta(port, nb_rx * nb_threads, dev_info.reta_size);
   if (retval < 0)
     throw std::runtime_error(
         std::format("Could not start device: {}", strerror(-retval)));

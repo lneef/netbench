@@ -37,7 +37,7 @@ struct udp_builder : l4_builder {
     auto *udp = rte_pktmbuf_mtod_offset(pkt, rte_udp_hdr *, kHeaderOffSet);
     udp->src_port = rte_cpu_to_be_16(flow * rte_lcore_count() + tid);
     udp->dst_port = rte_cpu_to_be_16(kDefaultRxPort);
-    udp->dgram_len = rte_cpu_to_be_16(config.mtu - sizeof(rte_ipv4_hdr));
+    udp->dgram_len = rte_cpu_to_be_16(len);
     udp->dgram_cksum = 0;
     pkt->l4_len = sizeof(*udp);
     pkt->data_len += len;
