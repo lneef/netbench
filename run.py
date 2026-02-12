@@ -7,13 +7,13 @@ BS = 64
 def run(threads, args):
 
     threads = '0' if threads == 1 else f'0-{threads - 1}'
-    cmd = './build/dpdk-ping -l {} -a \"{},llq_policy={}\" -- --sip {} --dip {} --dmac {} --flows {} --bs {} --mode FORWARD --rt {} --ntx {}'.format(threads, *args)
+    cmd = './build/dpdk-ping -l {} -a {},llq_policy={} -- --sip {} --dip {} --dmac {} --flows {} --bs {} --mode FORWARD --rt {} --ntx {}'.format(threads, *args)
     output = subprocess.run(cmd.split(' '), capture_output=True, text=True)
     print(output)
     if output is None:
         raise RuntimeError
     else:
-        output = list(filter(lambda l : l.startswith('Submitted PPS:'), output.stdout))
+        output = list(filter(lambda l : l.startswith('Submitted PPS:'), output.stdout.split('\n')))
     if not output:
         raise RuntimeError
     pps = output[0].split(' ')[-1]
@@ -41,17 +41,17 @@ def main():
     res = {}
 
     for tx in ntx:
-        pps = run(threads = 1, args = [pci, llq_policy, sip, dip, dmac, tx, BS, tx, RT])
+        pps = run(threads = 1, args = [pci, llq_policy, sip, dip, dmac, tx, BS, RT, tx])
         res[(1, tx)] = pps
 
     for t in threads:
-        pps = run(threads = t, args = [pci, llq_policy, sip, dip, dmac, 1, BS, 1, RT])
+        pps = run(threads = t, args = [pci, llq_policy, sip, dip, dmac, 1, BS, RT, 1])
         res[(t, 1)] = pps
 
     result = []
     print('Threads  TX  llq_policy  pps')
-    for (thrds, tx), pps in res:
-        result.append((thrds, ntx, llq_policy, pps))
+    for (thrds, tx), pps in res.items():
+        result.append((thrds, tx, llq_policy, pps))
     print(result)
 
 if __name__ == '__main__':
