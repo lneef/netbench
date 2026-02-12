@@ -36,7 +36,7 @@ def main():
 
     threads = [1, 2, 4, 8, 16]
     ntx = [1, 2, 4, 8, 16]
-    pci = "00:06.0"
+    pci = '00:06.0'
     llq_policy = 2
     res = {}
 
