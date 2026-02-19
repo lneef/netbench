@@ -98,7 +98,7 @@ def toeplitz_key_type(str):
 
     return [int(key_elem, 16) for key_elem in str.split(':')]
 
-def find_sport_per_peer(rx_ip, rx_port, tx_ip, n, key=None):
+def find_sport_per_peer(rx_ip, tx_port, tx_ip, n, key=None):
     """Find a source port for each peer such that each peer obtains a different
     ReTa entry modulo n.
 
@@ -114,7 +114,7 @@ def find_sport_per_peer(rx_ip, rx_port, tx_ip, n, key=None):
     found = 0
 
     for sport in range(0, 65535):
-        tx_port = [(sport & 0xff00) >> 8, sport & 0x00ff]
+        rx_port = [(sport & 0xff00) >> 8, sport & 0x00ff]
         hash_val = calculate_hash(rx_ip, rx_port, tx_ip, tx_port, 0, list(key))
         entry = hash_val % 128
         peer = entry % n
@@ -170,7 +170,7 @@ def main():
     # DPDK and freeBSD drivers follow the standard implementation
     print("DPDK".ljust(50), f"\t{hex(hash)} (RSS table entry: {rss_table_entry})")
 
-    ports = find_sport_per_peer(rx_ip, rx_port, tx_ip, args.n)
+    ports = find_sport_per_peer(rx_ip, tx_port, tx_ip, args.n)
 
     print(ports)
 
