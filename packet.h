@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <rte_ether.h>
 #include <rte_ip.h>
+#include <rte_ip4.h>
 #include <rte_lcore.h>
 #include <rte_mbuf_core.h>
 #include <rte_tcp.h>
@@ -17,6 +18,8 @@
 using pkt_t = rte_mbuf;
 
 static constexpr uint16_t kDefaultTTL = 64;
+static constexpr size_t kDataOffset =
+    sizeof(rte_ether_hdr) + sizeof(rte_ipv4_hdr) + sizeof(rte_udp_hdr);
 struct l4_builder {
   static constexpr uint16_t kHeaderOffSet =
       sizeof(rte_ether_hdr) + sizeof(rte_ipv4_hdr);
@@ -72,9 +75,7 @@ struct udp_builder : l4_builder {
 
   uint16_t ip_next_proto() const { return IPPROTO_UDP; }
 
-  uint16_t data_offset() const{
-      return kHeaderOffSet + sizeof(rte_udp_hdr);
-  }
+  uint16_t data_offset() const { return kHeaderOffSet + sizeof(rte_udp_hdr); }
 };
 
 struct tcp_builder : l4_builder {
@@ -102,13 +103,13 @@ struct tcp_builder : l4_builder {
   }
 
   void packet_cksum(pkt_t *pkt, capabilities &caps) {
-    rte_ipv4_hdr *ipv4 = rte_pktmbuf_mtod_offset(
-        pkt, struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
+    rte_ipv4_hdr *ipv4 = rte_pktmbuf_mtod_offset(pkt, struct rte_ipv4_hdr *,
+                                                 sizeof(struct rte_ether_hdr));
     rte_tcp_hdr *tcp = (struct rte_tcp_hdr *)(ipv4 + 1);
     tcp->cksum = 0;
     ipv4->hdr_checksum = 0;
     if (!caps.l4_cksum_tx) {
-       tcp->cksum = rte_ipv4_udptcp_cksum(ipv4, tcp);
+      tcp->cksum = rte_ipv4_udptcp_cksum(ipv4, tcp);
     } else {
       pkt->ol_flags |=
           RTE_MBUF_F_TX_TCP_CKSUM | RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_IPV4;
@@ -128,23 +129,18 @@ struct tcp_builder : l4_builder {
 
   uint16_t ip_next_proto() const { return IPPROTO_TCP; }
 
-  uint16_t data_offset() const{
-      return kHeaderOffSet + sizeof(rte_tcp_hdr);
-  }
+  uint16_t data_offset() const { return kHeaderOffSet + sizeof(rte_tcp_hdr); }
 };
 
 template <typename L4 = udp_builder> class packet_generator {
 public:
   packet_generator(capabilities &caps, port_info &info,
                    const benchmark_config &config)
-      : caps(caps), config(config),
-        l4(config) {
+      : caps(caps), config(config), l4(config) {
     rte_ether_addr_copy(&info.addr, &addr);
   }
 
-  uint16_t data_offset() const{
-      return l4.data_offset();
-  }
+  uint16_t data_offset() const { return l4.data_offset(); }
 
   void packet_eth_ctor(pkt_t *mbuf, rte_ether_hdr *eth) {
     rte_ether_addr_copy(&addr, &eth->src_addr);
@@ -184,7 +180,7 @@ public:
   }
 
   bool packet_pong_ctor(pkt_t *pkt) {
-    static_assert(std::is_same_v<L4, udp_builder>, "No Tcp Supported");  
+    static_assert(std::is_same_v<L4, udp_builder>, "No Tcp Supported");
     struct rte_ether_hdr *eth = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
     struct rte_ipv4_hdr *ipv4 = (struct rte_ipv4_hdr *)(eth + 1);
     struct rte_udp_hdr *udp = (struct rte_udp_hdr *)(ipv4 + 1);
@@ -219,7 +215,7 @@ public:
   }
 
   void packet_cksum(pkt_t *mbuf) {
-    l4.packet_cksum(mbuf, caps);  
+    l4.packet_cksum(mbuf, caps);
     packet_ipv4_cksum(mbuf);
   }
 

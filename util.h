@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <generic/rte_byteorder.h>
+#include <generic/rte_cycles.h>
 #include <netinet/in.h>
 #include <rte_build_config.h>
 #include <rte_byteorder.h>
@@ -72,6 +73,21 @@ struct dpdk_allocator{
 
     static void deallocate(T* ptr, __rte_unused std::size_t n){
         rte_free(ptr);
+    }
+};
+
+struct rate_limiter{
+    uint64_t last_update = 0;
+    float rate = 0;
+    rate_limiter(float bps): last_update(rte_get_timer_cycles()), rate(rte_get_timer_hz() / bps) {}
+
+    void notify(uint64_t now, uint16_t sent, uint64_t sz){
+        last_update = now + rate * (sent * sz);
+    }
+
+    bool sendable(uint64_t now, size_t amount){
+        return rate == 0 ? true : amount * rate + last_update >= now;
+    
     }
 };
 

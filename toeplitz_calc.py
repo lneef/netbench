@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from random import randint
 import sys
 import argparse
 import re
@@ -43,11 +44,11 @@ Usage example:
 # is a manipulated version of Microsoft's RSS key:
 # https://docs.microsoft.com/en-us/windows-hardware/drivers/network/verifying-the-rss-hash-calculation
 RSS_DEFAULT_KEY = [
-	0xbe, 0xac, 0x01, 0xfa, 0x6a, 0x42, 0xb7, 0x3b,
-	0x80, 0x30, 0xf2, 0x0c, 0x77, 0xcb, 0x2d, 0xa3,
-	0xae, 0x7b, 0x30, 0xb4, 0xd0, 0xca, 0x2b, 0xcb,
-	0x43, 0xa3, 0x8f, 0xb0, 0x41, 0x67, 0x25, 0x3d,
-	0x25, 0x5b, 0x0e, 0xc2, 0x6d, 0x5a, 0x56, 0xda
+    0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2,
+0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f, 0xb0,
+0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4,
+0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30, 0xf2, 0x0c,
+0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa    
 ]
 
 BITS_IN_BYTE = 8
@@ -110,7 +111,7 @@ def find_sport_per_peer(rx_ip, tx_port, tx_ip, n, key=None):
     if key is None:
         key = RSS_DEFAULT_KEY
 
-    results = [None] * n 
+    results = [None] * n
     found = 0
 
     for sport in range(0, 65535):
@@ -127,14 +128,65 @@ def find_sport_per_peer(rx_ip, tx_port, tx_ip, n, key=None):
 
     return results
 
+def investigate_reta_distribution(tx_ip, rx_ips, n_threads, reta_size=128,
+                                   n_samples=100000, key=None):
+    """Investigate the RETA distribution across n_threads queues using
+    randomly chosen source and destination ports.
+
+    rx_ips is a list of client IPs (each a list of 4 octets).
+    Computes the Toeplitz hash for 16 flows per client IP,
+    maps each hash through the RETA table, and reports the per-queue distribution.
+    """
+    import random
+
+    if key is None:
+        key = RSS_DEFAULT_KEY
+
+    # Normalize: if rx_ips is a single IP (list of ints), wrap it
+    if isinstance(rx_ips[0], int):
+        rx_ips = [rx_ips]
+
+    # Build RETA table: round-robin assignment of queues
+    reta = [i % n_threads for i in range(reta_size)]
+
+    queue_counts = [0] * n_threads
+    samples = 0
+
+    for rx_ip in rx_ips:
+        rx_ip_str = '.'.join(str(b) for b in rx_ip)
+        print(f"\nClient {rx_ip_str}:")
+        rest_upper = random.randint(1, 65535)
+        rest = 0
+        while rest < rest_upper % 16:
+            sport = random.randint(0, 65535) 
+            dport = random.randint(0, 65535)
+            src_port = [(sport & 0xff00) >> 8, sport & 0x00ff]
+            dst_port = [(dport & 0xff00) >> 8, dport & 0x00ff] 
+            rest += 1
+            h = calculate_hash(rx_ip, src_port, tx_ip, dst_port, 0, list(key))
+            print('here '+ str(h % reta_size))
+            queue = reta[h % reta_size]
+            queue_counts[queue] += 1
+            samples += 1
+
+    expected = samples / n_threads
+    print(f"\nRETA distribution: {samples} flows from {len(rx_ips)} clients across {n_threads} queues (reta_size={reta_size})")
+    print(f"{'Queue':<8} {'Count':>8} {'Percent':>8} {'Deviation':>10}")
+    print("-" * 38)
+    for q in range(n_threads):
+        pct = 100.0 * queue_counts[q] / samples
+        dev = 100.0 * (queue_counts[q] - expected) / expected
+        print(f"{q:<8} {queue_counts[q]:>8} {pct:>7.2f}% {dev:>+9.2f}%")
+
+
 def main():
 
     parser = argparse.ArgumentParser(description='ENA Toeplitz hash calculator',
                                      formatter_class=argparse.RawDescriptionHelpFormatter,
                                      epilog=USAGE_EXAMPLE)
 
-    parser.add_argument('-r', '--rx-ip', help='Receiving side ipv4', dest='rx_ip', nargs='?',
-                        required=True, type=ipv4_addr_type)
+    parser.add_argument('-r', '--rx-ip', help='Receiving side ipv4 (can specify multiple)', dest='rx_ips',
+                        nargs='+', required=True, type=ipv4_addr_type)
     parser.add_argument('-R', '--rx-port', help='Receiving side port', dest='rx_port', nargs='?',
                         required=True, type=int)
     parser.add_argument('-t', '--tx-ip', help='Transmitting side ipv4',
@@ -146,7 +198,7 @@ def main():
 
     args = parser.parse_args()
 
-    rx_ip   = args.rx_ip
+    rx_ips  = args.rx_ips
     tx_ip   = args.tx_ip
     # "break" port number into two byte representation
     rx_port = [(args.rx_port & 0xff00) >> 8, args.rx_port & 0x00ff]
@@ -155,24 +207,27 @@ def main():
     initial_value = 0
     key = RSS_DEFAULT_KEY
 
-    # calculate the hash with inital value of 0x0xffffffff
-    hash = calculate_hash(rx_ip, rx_port, tx_ip, tx_port, initial_value, key)
-
-    rss_table_entry = hash % 128
-
     tx_ip_str = '.'.join([str(byte) for byte in args.tx_ip])
-    rx_ip_str = '.'.join([str(byte) for byte in args.rx_ip])
-    print(f"Sending traffic from {tx_ip_str}:{args.tx_port} to {rx_ip_str}:{args.rx_port}")
 
-    print("to an instance which supports changing the key\n")
-    print("Should result in the following hash for each driver:")
+    for rx_ip in rx_ips:
+        rx_ip_str = '.'.join([str(byte) for byte in rx_ip])
 
-    # DPDK and freeBSD drivers follow the standard implementation
-    print("DPDK".ljust(50), f"\t{hex(hash)} (RSS table entry: {rss_table_entry})")
+        # calculate the hash with inital value of 0x0xffffffff
+        hash = calculate_hash(rx_ip, rx_port, tx_ip, tx_port, initial_value, key)
 
-    ports = find_sport_per_peer(rx_ip, tx_port, tx_ip, args.n)
+        rss_table_entry = hash % 128
 
-    print(ports)
+        print(f"Sending traffic from {tx_ip_str}:{args.tx_port} to {rx_ip_str}:{args.rx_port}")
+        print("to an instance which supports changing the key\n")
+        print("Should result in the following hash for each driver:")
+
+        # DPDK and freeBSD drivers follow the standard implementation
+        print("DPDK".ljust(50), f"\t{hex(hash)} (RSS table entry: {rss_table_entry})")
+
+        ports = find_sport_per_peer(rx_ip, tx_port, tx_ip, args.n)
+        print(ports)
+
+    investigate_reta_distribution(tx_ip, rx_ips, args.n)
 
 if __name__ == '__main__':
     main()

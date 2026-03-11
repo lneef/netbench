@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cstring>
 #include <rte_branch_prediction.h>
 #include <rte_common.h>
 #include <rte_cycles.h>
@@ -31,7 +32,7 @@
 
 void dump_pkt(rte_mbuf *msg, uint16_t len) {
   static constexpr size_t bytes_per_line = 16;
-  auto *data = rte_pktmbuf_mtod(msg, char*);
+  auto *data = rte_pktmbuf_mtod(msg, char *);
   for (size_t i = 0; i < len; i += bytes_per_line) {
     printf("%04zx  ", i);
     for (size_t j = 0; j < bytes_per_line; ++j) {
@@ -76,6 +77,14 @@ static void add_timestamp_rtdsc(packet_generator<> &pg,
     uint8_t *data = rte_pktmbuf_mtod_offset(pkt, uint8_t *, pg.data_offset());
     PUN(data, &pc, typeof(pc));
     pg.packet_cksum(pkt);
+  }
+}
+
+static void insert_seq(std::span<pkt_t *> pkts, uint64_t &seq) {
+  for (auto *pkt : pkts) {
+    auto *seq_ptr = rte_pktmbuf_mtod_offset(pkt, uint8_t *, kDataOffset);
+    std::memcpy(seq_ptr, &seq, sizeof(seq));
+    ++seq;
   }
 }
 
@@ -168,6 +177,72 @@ template <bool mq, typename L4> int lcore_send(void *port) {
   return 0;
 }
 
+template <typename L4> int lcore_count(void *port) {
+  static constexpr uint64_t kDefaultCnt = 1e6;
+  auto &[info, config] = *static_cast<lcore_adapter *>(port);
+  uint16_t tx_free = config.burst_size, tx_nb;
+  auto &tb = info.local();
+  packet_generator<L4> pg(info.caps, info, config);
+  std::vector<pkt_t *> pkts(tx_free);
+  rte_mempool_obj_iter(tb.send_pool.get(), packet_mempool_ctor_full<L4>, &pg);
+  uint64_t txd = 0;
+  uint64_t seq = 0;
+  for (; txd < kDefaultCnt;) {
+    auto pending = config.burst_size - tx_free;  
+    if (!rte_mempool_get_bulk(tb.send_pool.get(),
+                              (void **)pkts.data() + pending, tx_free)) {
+      insert_seq(std::span(pkts).subspan(pending, tx_free),
+                 seq);
+      tx_free = 0;
+    }
+    tx_nb =
+        rte_eth_tx_burst(info.port_id, tb.tx_queues.front(),
+                         pkts.data(), pending);
+
+    for (uint16_t i = tx_nb, j = 0; i < pending; ++i, ++j)
+      pkts[j] = pkts[i];
+    tx_free += tx_nb;
+    txd += tx_nb;
+
+    tb.per_thread_submit_stat.submitted += tx_nb;
+  }
+  sleep(3);
+  return 0;
+}
+
+int lcore_duplex(void *port) {
+  auto &[info, config] = *static_cast<lcore_adapter *>(port);
+  uint16_t tx_free = config.burst_size;
+  auto &tb = info.local();
+  packet_generator<udp_builder> pg(info.caps, info, config);
+  rate_limiter rt(config.bps);
+  std::vector<pkt_t *> pkts(tx_free);
+  std::vector<pkt_t *> rpkts(tx_free);
+  rte_mempool_obj_iter(tb.send_pool.get(),
+                       packet_mempool_ctor_full<udp_builder>, &pg);
+  uint64_t cycles = rte_get_timer_cycles();
+  uint64_t end = config.rtime * rte_get_timer_hz() + cycles;
+  for (; cycles < end; cycles = rte_get_timer_cycles()) {
+    if (!rte_mempool_get_bulk(tb.send_pool.get(), (void **)pkts.data(),
+                              tx_free))
+      tx_free = 0;
+    if (rt.sendable(cycles, ((config.burst_size - tx_free) * config.mtu))) {
+      auto tx_nb =
+          rte_eth_tx_burst(info.port_id, tb.tx_queues.front(),
+                           pkts.data() + tx_free, config.burst_size - tx_free);
+      tx_free += tx_nb;
+      tb.per_thread_submit_stat.submitted += tx_nb;
+      rt.notify(rte_get_timer_cycles(), tx_nb, config.mtu);
+    }
+    auto rx_nb = rte_eth_rx_burst(info.port_id, tb.rx_queues.front(),
+                                  rpkts.data(), config.burst_size);
+    rte_pktmbuf_free_bulk(rpkts.data(), rx_nb);
+    tb.per_thread_stat.received += rx_nb;
+  }
+  sleep(3);
+  return 0;
+}
+
 void launch_forward(lcore_adapter &adapter) {
   auto &config = adapter.config;
   switch (config.transport) {
@@ -214,6 +289,25 @@ int main(int argc, char *argv[]) {
     print_stats(stats, submit_stats, config);
     break;
   }
+  case opmode::DUPLEX: {
+    submit_stat submit_stats{};
+    stat stats{};
+    launch_lcores(lcore_duplex, &adapter);
+    info.collect_statistics(stats);
+    info.collect_submit_statistics(submit_stats);
+    print_stats(stats, submit_stats, config);
+    break;
+  }
+  case opmode::COUNT: {
+    submit_stat submit_stats{};
+    stat stats{};
+    launch_lcores(lcore_count<udp_builder>, &adapter);
+    info.collect_statistics(stats);
+    info.collect_submit_statistics(submit_stats);
+    print_stats(stats, submit_stats, config);
+    break;
+  }
+
   default:
     break;
   }

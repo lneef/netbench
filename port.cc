@@ -24,14 +24,14 @@ static uint8_t RSS_DEFAULT_KEY[] = {
 static constexpr unsigned RSS_KEY_LEN = 40;
 
 static std::unordered_map<std::string_view, opmode> opmodes{
-    {"PING", opmode::PING},
-    {"PONG", opmode::PONG},
-    {"FORWARD", opmode::FORWARD},
-    {"RECEIVE", opmode::RECEIVE}};
+    {"PING", opmode::PING},       {"PONG", opmode::PONG},
+    {"FORWARD", opmode::FORWARD}, {"RECEIVE", opmode::RECEIVE},
+    {"DUPLEX", opmode::DUPLEX},   {"COUNT", opmode::COUNT}};
 
 static bool is_receiver(opmode role) {
   return role == opmode::RECEIVE || role == opmode::PING ||
-         role == opmode::PONG;
+         role == opmode::PONG || role == opmode::DUPLEX ||
+         role == opmode::COUNT;
 }
 
 static rte_mempool *pool_create(std::string_view name, uint32_t pool_sz,
@@ -48,6 +48,8 @@ static rte_mempool *setup_send_pool(opmode role, uint32_t pool_sz,
   case opmode::PING:
   case opmode::FORWARD:
   case opmode::PONG:
+  case opmode::DUPLEX:
+  case opmode::COUNT:
     return pool_create(name, pool_sz, lcore_id, msize);
   default:
     return nullptr;
@@ -60,6 +62,8 @@ static rte_mempool *setup_receive_pool(opmode role, uint32_t pool_sz,
   switch (role) {
   case opmode::RECEIVE:
   case opmode::PING:
+  case opmode::DUPLEX:
+  case opmode::COUNT:
     return pool_create(name, pool_sz, lcore_id, msize);
   case opmode::PONG:
     return pool_create(name, 2 * pool_sz, lcore_id, msize);
@@ -79,12 +83,19 @@ alloc_pools(opmode role, uint32_t recv_pool_sz, uint32_t send_pool_sz,
 int benchmark_config::port_init_cmdline(int argc, char **argv) {
   int opt, option_index;
   static const struct option long_options[] = {
-      {"dip", required_argument, 0, 0},  {"sip", required_argument, 0, 0},
-      {"mtu", required_argument, 0, 0},  {"rt", required_argument, 0, 0},
-      {"bs", required_argument, 0, 0},   {"dmac", required_argument, 0, 0},
-      {"mode", required_argument, 0, 0}, {"flows", required_argument, 0, 0},
-      {"ntx", required_argument, 0, 0},  {"nrx", required_argument, 0, 0},
-      {"tcp", required_argument, 0, 0},  {0, 0, 0, 0}};
+      {"dip", required_argument, 0, 0},
+      {"sip", required_argument, 0, 0},
+      {"mtu", required_argument, 0, 0},
+      {"rt", required_argument, 0, 0},
+      {"bs", required_argument, 0, 0},
+      {"dmac", required_argument, 0, 0},
+      {"mode", required_argument, 0, 0},
+      {"flows", required_argument, 0, 0},
+      {"ntx", required_argument, 0, 0},
+      {"nrx", required_argument, 0, 0},
+      {"tcp", required_argument, 0, 0},
+      {"bps", required_argument, 0, 0},
+      {0, 0, 0, 0}};
   while ((opt = getopt_long(argc, argv, "", long_options, &option_index)) !=
          -1) {
     if (opt == '?')
@@ -128,6 +139,10 @@ int benchmark_config::port_init_cmdline(int argc, char **argv) {
     case 10:
       tcp_mss = atoi(optarg);
       transport = l4::TCP;
+      break;
+    case 11:
+      bps = atol(optarg);
+      break;
     default:
       break;
     }
@@ -213,12 +228,8 @@ int benchmark_config::port_init(port_info &info) {
   auto &rssconf = port_conf.rx_adv_conf.rss_conf;
   bool rss = nb_rx * nb_threads > 1;
 
-  if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_RSS_HASH && rss)
-    port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_RSS_HASH;
-  else
-      rss = false;
-
   if (rss) {
+    port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_RSS_HASH;
     port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
     rssconf.algorithm = RTE_ETH_HASH_FUNCTION_DEFAULT;
     if (dev_info.hash_key_size == RSS_KEY_LEN) {
@@ -255,8 +266,8 @@ int benchmark_config::port_init(port_info &info) {
     tb.s_name = std::format("SEND_POOL-{}", idx);
     tb.r_name = std::format("RECV_POOL-{}", idx++);
     auto [send_pool, recv_pool] =
-        alloc_pools(role, static_cast<uint32_t>(nb_rx) * (nb_rxd + burst_size),
-                    static_cast<uint32_t>(nb_tx) * (nb_txd + burst_size),
+        alloc_pools(role, static_cast<uint32_t>(nb_rx) * (2* nb_rxd - 1),
+                    static_cast<uint32_t>(nb_tx) * (2 * nb_txd - 1),
                     tb.r_name, tb.s_name, lcore_id, mbuf_size);
     tb.setup_txqueues(port, nb_tx, nb_txd, txconf, send_pool, setup_tx);
     tb.setup_rxqueues(port, nb_rx, nb_rxd, rxconf, recv_pool, setup_rx);

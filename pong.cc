@@ -1,4 +1,5 @@
 #include <rte_branch_prediction.h>
+#include <rte_byteorder.h>
 #include <rte_common.h>
 #include <rte_eal.h>
 #include <rte_ethdev.h>
@@ -13,9 +14,11 @@
 #include <rte_mbuf_dyn.h>
 
 #include <arpa/inet.h>
+#include <fstream>
 #include <rte_mempool.h>
 #include <sched.h>
 #include <signal.h>
+#include <span>
 #include <stdalign.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -79,10 +82,79 @@ static int lcore_recv(void *port) {
   for (; !terminate;) {
     nb_rx = 0;
     for (auto qid : tb.rx_queues)
-      nb_rx +=
-          rte_eth_rx_burst(info.port_id, qid, pkts.data() + nb_rx, config.burst_size);
+      nb_rx += rte_eth_rx_burst(info.port_id, qid, pkts.data() + nb_rx,
+                                config.burst_size);
     rte_pktmbuf_free_bulk(pkts.data(), nb_rx);
   }
+  return 0;
+}
+
+int lcore_count(void *port) {
+  static constexpr uint64_t kDefaultCnt = 1e6;
+  auto &[info, config] = *static_cast<lcore_adapter *>(port);
+  auto &tb = info.local();
+  std::vector<pkt_t *> pkts(config.burst_size);
+  std::vector<uint64_t> seqs;
+  packet_generator pg(info.caps, info, config);
+  seqs.reserve(kDefaultCnt);
+  auto fill = [&](std::span<pkt_t *> pkts) {
+    for (auto *pkt : pkts) {
+      auto *eth = rte_pktmbuf_mtod(pkt, rte_ether_hdr *);
+      if (eth->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4))
+        continue;
+      auto *seq = rte_pktmbuf_mtod_offset(pkt, uint64_t *, kDataOffset);
+      seqs.push_back(*seq);
+    }
+  };
+  while (!terminate) {
+    auto rxd = rte_eth_rx_burst(info.port_id, tb.rx_queues.front(), pkts.data(),
+                                config.burst_size);
+    fill(std::span(pkts).subspan(0, rxd));
+    rte_pktmbuf_free_bulk(pkts.data(), rxd);
+  }
+  std::ofstream ofs("seqs_port_" + std::to_string(info.port_id) + ".csv");
+  if (ofs) {
+    ofs << "entry,seq\n";
+    for (size_t i = 0; i < seqs.size(); ++i)
+      ofs << i << "," << seqs[i] << "\n";
+    ofs.close();
+
+  }
+  
+  return 0;
+}
+
+int lcore_duplex(void *port) {
+  auto &[info, config] = *static_cast<lcore_adapter *>(port);
+  uint16_t tx_free = config.burst_size;
+  auto &tb = info.local();
+  packet_generator<udp_builder> pg(info.caps, info, config);
+  std::vector<pkt_t *> pkts(tx_free);
+  std::vector<pkt_t *> rpkts(tx_free);
+  rte_mempool_obj_iter(tb.send_pool.get(),
+                       packet_mempool_ctor_full<udp_builder>, &pg);
+  rate_limiter rt(config.bps);
+  uint64_t cycles = rte_get_timer_cycles();
+  uint64_t end = config.rtime * rte_get_timer_hz() + cycles;
+  for (; cycles < end; cycles = rte_get_timer_cycles()) {
+    auto rx_nb = rte_eth_rx_burst(info.port_id, tb.rx_queues.front(),
+                                  rpkts.data(), config.burst_size);
+    rte_pktmbuf_free_bulk(rpkts.data(), rx_nb);
+    tb.per_thread_stat.received += rx_nb;
+
+    if (!rte_mempool_get_bulk(tb.send_pool.get(), (void **)pkts.data(),
+                              tx_free))
+      tx_free = 0;
+    if (rt.sendable(cycles, ((config.burst_size - tx_free) * config.mtu))) {
+      auto tx_nb =
+          rte_eth_tx_burst(info.port_id, tb.tx_queues.front(),
+                           pkts.data() + tx_free, config.burst_size - tx_free);
+      tx_free += tx_nb;
+      tb.per_thread_submit_stat.submitted += tx_nb;
+      rt.notify(rte_get_timer_cycles(), tx_nb, config.mtu);
+    }
+  }
+  sleep(3);
   return 0;
 }
 
@@ -101,10 +173,16 @@ int main(int argc, char *argv[]) {
 
   switch (config.role) {
   case opmode::RECEIVE:
-    launch_lcores(lcore_recv, &adapter);  
+    launch_lcores(lcore_recv, &adapter);
     break;
   case opmode::PONG:
     launch_lcores(lcore_pong, &adapter);
+    break;
+  case opmode::DUPLEX:
+    launch_lcores(lcore_duplex, &adapter);
+    break;
+  case opmode::COUNT:
+    launch_lcores(lcore_count, &adapter);
     break;
   default:
     break;

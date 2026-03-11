@@ -31,7 +31,7 @@
 #define ETHER_SIZE (RTE_ETHER_MAX_LEN + RTE_PKTMBUF_HEADROOM)
 #define JUMBO_SIZE (RTE_ETHER_MAX_JUMBO_FRAME_LEN + RTE_PKTMBUF_HEADROOM)
 
-enum class opmode { PING, PONG, FORWARD, RECEIVE };
+enum class opmode { PING, PONG, FORWARD, RECEIVE, DUPLEX, COUNT };
 
 enum class l4 {UDP, TCP};
 
@@ -54,6 +54,7 @@ struct benchmark_config {
   uint16_t nb_threads;
   uint16_t nb_tx, nb_rx;
   uint32_t mbuf_size;
+  uint32_t bps = 0;
   uint16_t tcp_mss = 0;
   l4 transport = l4::UDP;
   rte_ether_addr dmac;
