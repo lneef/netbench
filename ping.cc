@@ -191,6 +191,7 @@ template <typename L4> int lcore_count(void *port) {
   uint64_t txd = 0;
   uint64_t seq = 0;
   for (; txd < kDefaultCnt;) {
+    assert(tx_free <= config.burst_size);  
     auto pending = config.burst_size - tx_free;
     if (!rte_mempool_get_bulk(tb.send_pool.get(),
                               (void **)pkts.data() + pending, tx_free)) {
@@ -205,6 +206,7 @@ template <typename L4> int lcore_count(void *port) {
       }
       tx_free = 0;
     }
+    pending = config.burst_size - tx_free;
     tx_nb = rte_eth_tx_burst(info.port_id, tb.tx_queues.front(), pkts.data(),
                              pending);
 
