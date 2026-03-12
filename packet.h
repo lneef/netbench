@@ -9,6 +9,7 @@
 #include <rte_ip4.h>
 #include <rte_lcore.h>
 #include <rte_mbuf_core.h>
+#include <rte_random.h>
 #include <rte_tcp.h>
 #include <rte_udp.h>
 #include <type_traits>
@@ -47,6 +48,19 @@ struct udp_builder : l4_builder {
     pkt->pkt_len += len;
     flow = (flow + 1) % config.flows;
   }
+
+  void build_l4_header_flow(pkt_t *pkt, uint16_t sport) {
+    auto *udp = rte_pktmbuf_mtod_offset(pkt, rte_udp_hdr *, kHeaderOffSet);
+    udp->src_port = rte_cpu_to_be_16(sport);
+    udp->dst_port = rte_cpu_to_be_16(kDefaultRxPort);
+    udp->dgram_len = rte_cpu_to_be_16(len);
+    udp->dgram_cksum = 0;
+    pkt->l4_len = sizeof(*udp);
+    pkt->data_len += len;
+    pkt->pkt_len += len;
+  }
+
+
 
   void packet_cksum(pkt_t *pkt, capabilities &caps) {
     struct rte_ipv4_hdr *ipv4 = rte_pktmbuf_mtod_offset(
@@ -100,6 +114,24 @@ struct tcp_builder : l4_builder {
     pkt->tso_segsz = config.tcp_mss;
     pkt->ol_flags |= RTE_MBUF_F_TX_TCP_SEG;
     flow = (flow + 1) % config.flows;
+  }
+
+  void build_l4_header_flow(pkt_t *pkt, uint16_t sport) {
+    auto *tcp_header =
+        rte_pktmbuf_mtod_offset(pkt, rte_tcp_hdr *, kHeaderOffSet);
+    tcp_header->data_off = (sizeof(rte_tcp_hdr) / 4) << 4;
+    tcp_header->tcp_urp = 0;
+    tcp_header->recv_ack = 0;
+    tcp_header->sent_seq = 0;
+    tcp_header->cksum = 0;
+    tcp_header->rx_win = rte_cpu_to_be_16(std::numeric_limits<uint16_t>::max());
+    tcp_header->src_port = rte_cpu_to_be_16(sport);
+    tcp_header->dst_port = rte_cpu_to_be_16(kDefaultRxPort);
+    pkt->l4_len = sizeof(*tcp_header);
+    pkt->data_len += len;
+    pkt->pkt_len += len;
+    pkt->tso_segsz = config.tcp_mss;
+    pkt->ol_flags |= RTE_MBUF_F_TX_TCP_SEG;
   }
 
   void packet_cksum(pkt_t *pkt, capabilities &caps) {
@@ -174,6 +206,17 @@ public:
     mbuf->data_len = 0;
     mbuf->pkt_len = 0;
     l4.build_l4_header(mbuf);
+    packet_ipv4_ctor(mbuf, ipv4, config.mtu);
+    packet_eth_ctor(mbuf, eth);
+    mbuf->nb_segs = 1;
+  }
+
+  void packet_ctor_burst(pkt_t *mbuf, uint16_t flow) {
+    rte_ether_hdr *eth = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+    rte_ipv4_hdr *ipv4 = (struct rte_ipv4_hdr *)(eth + 1);
+    mbuf->data_len = 0;
+    mbuf->pkt_len = 0;
+    l4.build_l4_header_flow(mbuf, flow);
     packet_ipv4_ctor(mbuf, ipv4, config.mtu);
     packet_eth_ctor(mbuf, eth);
     mbuf->nb_segs = 1;

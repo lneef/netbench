@@ -80,12 +80,11 @@ static void add_timestamp_rtdsc(packet_generator<> &pg,
   }
 }
 
-static void insert_seq(std::span<pkt_t *> pkts, uint64_t &seq) {
-  for (auto *pkt : pkts) {
+static void insert_seq(pkt_t * pkt, uint64_t &seq) {
     auto *seq_ptr = rte_pktmbuf_mtod_offset(pkt, uint8_t *, kDataOffset);
     std::memcpy(seq_ptr, &seq, sizeof(seq));
     ++seq;
-  }
+  
 }
 
 static void print_submit_stat(submit_stat &submit_statistics,
@@ -184,20 +183,30 @@ template <typename L4> int lcore_count(void *port) {
   auto &tb = info.local();
   packet_generator<L4> pg(info.caps, info, config);
   std::vector<pkt_t *> pkts(tx_free);
-  rte_mempool_obj_iter(tb.send_pool.get(), packet_mempool_ctor_full<L4>, &pg);
+  std::vector<uint16_t> flows(config.flows);
+  for (auto &f : flows)
+    f = rte_rand() % UINT16_MAX;
+  uint16_t flow_idx = 0;
+  uint16_t burst_rem = config.burst_size;
   uint64_t txd = 0;
   uint64_t seq = 0;
   for (; txd < kDefaultCnt;) {
-    auto pending = config.burst_size - tx_free;  
+    auto pending = config.burst_size - tx_free;
     if (!rte_mempool_get_bulk(tb.send_pool.get(),
                               (void **)pkts.data() + pending, tx_free)) {
-      insert_seq(std::span(pkts).subspan(pending, tx_free),
-                 seq);
+      for (auto *pkt : std::span(pkts).subspan(pending, tx_free)) {
+        pg.packet_ctor_burst(pkt, flows[flow_idx]);
+        insert_seq(pkt, seq);
+        pg.packet_cksum(pkt);
+        if (--burst_rem == 0) {
+          flow_idx = (flow_idx + 1) % config.flows;
+          burst_rem = config.burst_size;
+        }
+      }
       tx_free = 0;
     }
-    tx_nb =
-        rte_eth_tx_burst(info.port_id, tb.tx_queues.front(),
-                         pkts.data(), pending);
+    tx_nb = rte_eth_tx_burst(info.port_id, tb.tx_queues.front(), pkts.data(),
+                             pending);
 
     for (uint16_t i = tx_nb, j = 0; i < pending; ++i, ++j)
       pkts[j] = pkts[i];
@@ -302,9 +311,6 @@ int main(int argc, char *argv[]) {
     submit_stat submit_stats{};
     stat stats{};
     launch_lcores(lcore_count<udp_builder>, &adapter);
-    info.collect_statistics(stats);
-    info.collect_submit_statistics(submit_stats);
-    print_stats(stats, submit_stats, config);
     break;
   }
 
