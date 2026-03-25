@@ -178,6 +178,7 @@ template <bool mq, typename L4> int lcore_send(void *port) {
 
 template <typename L4> int lcore_count(void *port) {
   static constexpr uint64_t kDefaultCnt = 1e6;
+  assert(rte_lcore_count() == 1);
   auto &[info, config] = *static_cast<lcore_adapter *>(port);
   uint16_t tx_free = config.burst_size, tx_nb;
   auto &tb = info.local();
@@ -187,7 +188,6 @@ template <typename L4> int lcore_count(void *port) {
   for (auto &f : flows)
     f = rte_rand() % UINT16_MAX;
   uint16_t flow_idx = 0;
-  uint16_t burst_rem = config.burst_size;
   uint64_t txd = 0;
   uint64_t seq = 0;
   for (; txd < kDefaultCnt;) {
@@ -199,10 +199,7 @@ template <typename L4> int lcore_count(void *port) {
         pg.packet_ctor_burst(pkt, flows[flow_idx]);
         insert_seq(pkt, seq);
         pg.packet_cksum(pkt);
-        if (--burst_rem == 0) {
           flow_idx = (flow_idx + 1) % config.flows;
-          burst_rem = config.burst_size;
-        }
       }
       tx_free = 0;
     }

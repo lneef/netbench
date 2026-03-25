@@ -217,6 +217,9 @@ int benchmark_config::port_init(port_info &info) {
   info.caps.l4_cksum_rx =
       dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_UDP_CKSUM;
 
+  if(dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_TIMESTAMP)
+      printf("timestamps supported\n");
+
   if (transport == l4::TCP &&
       !(port_conf.txmode.offloads & RTE_ETH_TX_OFFLOAD_TCP_TSO))
     throw std::runtime_error("TCP without tso not supported");
