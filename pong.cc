@@ -1,3 +1,5 @@
+#include <cstdint>
+#include <generic/rte_cycles.h>
 #include <rte_branch_prediction.h>
 #include <rte_byteorder.h>
 #include <rte_common.h>
@@ -24,6 +26,8 @@
 #include <stdint.h>
 #include <sys/socket.h>
 #include <vector>
+
+#include <hdr/hdr_histogram.h>
 
 #include "packet.h"
 #include "port.h"
@@ -54,9 +58,21 @@ static int lcore_pong(void *port) {
   uint16_t nb_rx, nb_tx = 0, nb_rm = 0;
   auto &tb = pinfo.local();
   packet_generator pg(pinfo.caps, pinfo, config);
+  auto ticks_per_ns = rte_get_timer_hz() / 1e9;
+  struct hdr_histogram *rx_hist = nullptr;
+  hdr_init(1, 1000000, 3, &rx_hist);
+
   for (; !terminate;) {
+    auto begin = rte_get_timer_cycles();
     nb_rx = rte_eth_rx_burst(pinfo.port_id, tb.rx_queues.front(), pkts.data(),
                              config.burst_size - nb_rm);
+    auto end = rte_get_timer_cycles();
+
+    if (nb_rx == 0)
+      continue;
+
+    hdr_record_value(rx_hist, end - begin / (ticks_per_ns * nb_rx));
+
     for (uint16_t i = 0; i < nb_rx; ++i) {
       pkts_out[nb_rm] = pkts[i];
       if (likely(handle_packet(pg, pkts_out[nb_rm])))
@@ -71,6 +87,16 @@ static int lcore_pong(void *port) {
       pkts_out[j] = pkts_out[i];
     nb_rm = nb_rm - nb_tx;
   }
+
+  {
+    FILE *f = fopen("rx_overhead_hist.csv", "w");
+    if (f) {
+      hdr_percentiles_print(rx_hist, f, 5, 1.0, CSV);
+      fclose(f);
+    }
+  }
+  hdr_close(rx_hist);
+
   return 0;
 }
 

@@ -25,6 +25,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include <hdr/hdr_histogram.h>
+
 #include "packet.h"
 #include "port.h"
 #include "statistics.h"
@@ -46,7 +48,9 @@ void dump_pkt(rte_mbuf *msg, uint16_t len) {
 }
 
 static uint16_t handle_pong_rdtsc(packet_generator<> &pg, stat &statistics,
-                                  std::span<pkt_t *> pkts, uint16_t nb_rx) {
+                                  std::span<pkt_t *> pkts, uint16_t nb_rx,
+                                  struct hdr_histogram *rtt_hist,
+                                  double ticks_per_ns) {
   struct pkt_content_rdtsc pc, rc;
   uint64_t elapsed = 0;
   uint16_t rx_count = 0;
@@ -62,6 +66,7 @@ static uint16_t handle_pong_rdtsc(packet_generator<> &pg, stat &statistics,
     }
     PUN(&rc, data, typeof(rc));
     elapsed = pc.time - rc.time;
+    hdr_record_value(rtt_hist, (int64_t)(elapsed / ticks_per_ns));
     statistics.time += elapsed;
     statistics.min = RTE_MIN(statistics.min, elapsed);
     ++statistics.received;
@@ -114,6 +119,9 @@ int lcore_ping(void *port) {
   std::vector<pkt_t *> rpkts(config.burst_size);
   auto tx_queue = tb.tx_queues.front();
   auto rx_queue = tb.rx_queues.front();
+  auto ticks_per_ns = rte_get_timer_hz() / 1e9;
+  struct hdr_histogram *rtt_hist = nullptr;
+  hdr_init(1, 1000000000, 3, &rtt_hist);
 
   rte_mempool_obj_iter(tb.send_pool.get(), packet_mempool_ctor<udp_builder>,
                        &pg);
@@ -136,10 +144,21 @@ int lcore_ping(void *port) {
       rx_nb = rte_eth_rx_burst(info.port_id, rx_queue, rpkts.data(),
                                config.burst_size);
       if (rx_nb)
-        rx_total += handle_pong_rdtsc(pg, tb.per_thread_stat, rpkts, rx_nb);
+        rx_total += handle_pong_rdtsc(pg, tb.per_thread_stat, rpkts, rx_nb,
+                                      rtt_hist, ticks_per_ns);
 
     } while (rx_total < tx_nb && rte_get_timer_cycles() < end);
   }
+
+  {
+    FILE *f = fopen("rtt_hist.csv", "w");
+    if (f) {
+      hdr_percentiles_print(rtt_hist, f, 5, 1.0, CSV);
+      fclose(f);
+    }
+  }
+  hdr_close(rtt_hist);
+
   return 0;
 }
 

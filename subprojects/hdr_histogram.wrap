@@ -1,0 +1,7 @@
+[wrap-git]
+url = https://github.com/HdrHistogram/HdrHistogram_c.git
+revision = 0.11.8
+depth = 1
+
+[provide]
+hdr_histogram = hdr_histogram_dep

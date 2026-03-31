@@ -1,3 +1,5 @@
 build/
+subprojects/hdr_histogram
+subprojects/.wraplock
 compile_commands.json
 .cache/
