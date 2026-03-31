@@ -105,6 +105,7 @@ static int lcore_recv(void *port) {
   std::vector<pkt_t *> pkts(config.burst_size * config.nb_rx);
   auto &tb = info.local();
   uint16_t nb_rx;
+  auto ticks_per_ns = rte_get_timer_hz() / 1e9;
   struct hdr_histogram *rx_hist = nullptr;
   hdr_init(1, 1000000, 3, &rx_hist);
   for (; !terminate;) {
@@ -120,7 +121,7 @@ static int lcore_recv(void *port) {
       if(!rx)
           continue;
       nb_rx += rx;
-      hdr_record_value(rx_hist, end - begin / (rx));
+      hdr_record_value(rx_hist, (end - begin) / (rx * ticks_per_ns));
     }
     rte_pktmbuf_free_bulk(pkts.data(), nb_rx);
   }
