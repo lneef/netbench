@@ -112,12 +112,15 @@ static int lcore_recv(void *port) {
     for (auto qid : tb.rx_queues) {
 
       auto begin = rte_get_timer_cycles();
-      nb_rx += rte_eth_rx_burst(info.port_id, qid, pkts.data() + nb_rx,
+      auto rx = rte_eth_rx_burst(info.port_id, qid, pkts.data() + nb_rx,
                                 config.burst_size);
 
       auto end = rte_get_timer_cycles();
 
-      hdr_record_value(rx_hist, end - begin / (nb_rx));
+      if(!rx)
+          continue;
+      nb_rx += rx;
+      hdr_record_value(rx_hist, end - begin / (rx));
     }
     rte_pktmbuf_free_bulk(pkts.data(), nb_rx);
   }
