@@ -105,13 +105,31 @@ static int lcore_recv(void *port) {
   std::vector<pkt_t *> pkts(config.burst_size * config.nb_rx);
   auto &tb = info.local();
   uint16_t nb_rx;
+  struct hdr_histogram *rx_hist = nullptr;
+  hdr_init(1, 1000000, 3, &rx_hist);
   for (; !terminate;) {
     nb_rx = 0;
-    for (auto qid : tb.rx_queues)
+    for (auto qid : tb.rx_queues) {
+
+      auto begin = rte_get_timer_cycles();
       nb_rx += rte_eth_rx_burst(info.port_id, qid, pkts.data() + nb_rx,
                                 config.burst_size);
+
+      auto end = rte_get_timer_cycles();
+
+      hdr_record_value(rx_hist, end - begin / (nb_rx));
+    }
     rte_pktmbuf_free_bulk(pkts.data(), nb_rx);
   }
+
+  {
+    FILE *f = fopen("rx_overhead_hist.csv", "w");
+    if (f) {
+      hdr_percentiles_print(rx_hist, f, 5, 1.0, CSV);
+      fclose(f);
+    }
+  }
+  hdr_close(rx_hist);
   return 0;
 }
 
@@ -144,9 +162,8 @@ int lcore_count(void *port) {
     for (size_t i = 0; i < seqs.size(); ++i)
       ofs << i << "," << seqs[i] << "\n";
     ofs.close();
-
   }
-  
+
   return 0;
 }
 
