@@ -232,7 +232,6 @@ int benchmark_config::port_init(port_info &info) {
   bool rss = nb_rx * nb_threads > 1;
 
   if (rss) {
-    port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_RSS_HASH;
     port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
     rssconf.algorithm = RTE_ETH_HASH_FUNCTION_DEFAULT;
     if (dev_info.hash_key_size == RSS_KEY_LEN) {
